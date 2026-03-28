@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  me-api-proxy:
+    image: xiicu/me-api-proxy:latest
+    ports:
+      - "38001:8080"
+    volumes:
+      - ~/.me-api-proxy:/root/.me-api-proxy
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
