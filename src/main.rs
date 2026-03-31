@@ -24,8 +24,7 @@ use tracing::{error, info};
 use url::Url;
 
 const DEFAULT_CONFIG: &str = r#"{
-  "newapis": "https://newapis.xyz",
-  "default": "http://demo.com"
+  "newapis": "https://newapis.xyz"
 }"#;
 
 const HOP_BY_HOP_HEADERS: &[&str] = &[
