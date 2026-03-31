@@ -3,18 +3,37 @@ set -e
 
 IMAGE_NAME="xiicu/me-api-proxy"
 TAG="latest"
+DOCKER_CONFIG_DIR="${DOCKER_CONFIG_DIR:-/tmp/docker-config-no-creds}"
+
+prepare_docker_config() {
+  mkdir -p "$DOCKER_CONFIG_DIR"
+
+  if [ -f "$HOME/.docker/config.json" ]; then
+    cp "$HOME/.docker/config.json" "$DOCKER_CONFIG_DIR/config.json"
+    ruby -rjson -e '
+      path = ARGV[0]
+      json = JSON.parse(File.read(path))
+      json.delete("credsStore")
+      File.write(path, JSON.pretty_generate(json))
+    ' "$DOCKER_CONFIG_DIR/config.json"
+  elif [ ! -f "$DOCKER_CONFIG_DIR/config.json" ]; then
+    echo '{"auths":{}}' > "$DOCKER_CONFIG_DIR/config.json"
+  fi
+}
 
 case "$1" in
   build)
     echo "Building image..."
-    docker build -t $IMAGE_NAME:$TAG .
+    prepare_docker_config
+    DOCKER_CONFIG="$DOCKER_CONFIG_DIR" docker build -t $IMAGE_NAME:$TAG .
     echo "Build complete: $IMAGE_NAME:$TAG"
     ;;
   push)
+    prepare_docker_config
     echo "Logging in as xiicu (enter password interactively)..."
-    docker login -u xiicu
+    DOCKER_CONFIG="$DOCKER_CONFIG_DIR" docker login -u xiicu
     echo "Pushing image..."
-    docker push $IMAGE_NAME:$TAG
+    DOCKER_CONFIG="$DOCKER_CONFIG_DIR" docker push $IMAGE_NAME:$TAG
     echo "Push complete"
     ;;
   start)

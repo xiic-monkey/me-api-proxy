@@ -1,4 +1,4 @@
-FROM rust:1.82-slim AS builder
+FROM rust:1.83-slim AS builder
 
 WORKDIR /app
 COPY . .
@@ -6,9 +6,8 @@ RUN cargo build --release
 
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-
 COPY --from=builder /app/target/release/me-api-proxy /usr/local/bin/
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 EXPOSE 8080
 

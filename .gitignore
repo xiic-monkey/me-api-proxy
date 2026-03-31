@@ -1,1 +1,9 @@
 /target
+**/*.rs.bk
+
+# Local environment and editor files
+.env
+.env.*
+.idea/
+.vscode/
+.DS_Store
