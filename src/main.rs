@@ -1,75 +1,94 @@
 use axum::{
-    body::{to_bytes, Body, Bytes},
-    extract::{Request, State},
-    http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
-    response::{IntoResponse, Response},
+    body::Body,
+    extract::{
+        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
+        FromRequestParts, Request, State,
+    },
+    http::{header, HeaderMap, HeaderValue, Response, StatusCode},
+    response::IntoResponse,
     Router,
 };
+use futures_util::{sink::SinkExt, stream::StreamExt};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
+use tokio_tungstenite::tungstenite::{
+    client::IntoClientRequest,
+    protocol::{frame::coding::CloseCode as WsCloseCode, CloseFrame as WsCloseFrame, Message as WsMessage},
+};
 use tower_http::trace::TraceLayer;
-use tracing;
+use tracing::{error, info};
+use url::Url;
 
-/// 默认配置：当配置文件不存在时自动创建
 const DEFAULT_CONFIG: &str = r#"{
   "newapis": "https://newapis.xyz",
   "default": "http://demo.com"
 }"#;
 
-/// 逐跳头部列表 - 这些头部仅在单次连接中有效，不应被代理转发
 const HOP_BY_HOP_HEADERS: &[&str] = &[
     "connection",
     "keep-alive",
     "proxy-authenticate",
     "proxy-authorization",
     "te",
+    "trailer",
     "trailers",
     "transfer-encoding",
     "upgrade",
 ];
 
-/// 应用状态：包含 HTTP 客户端和路由映射
+const WS_HANDSHAKE_HEADERS: &[&str] = &[
+    "host",
+    "connection",
+    "upgrade",
+    "sec-websocket-key",
+    "sec-websocket-version",
+    "sec-websocket-extensions",
+];
+
 #[derive(Clone)]
 struct AppState {
-    routes: Arc<RwLock<HashMap<String, String>>>, // 路由映射，支持并发读写
+    routes: Arc<RwLock<HashMap<String, String>>>,
+    client: reqwest::Client,
 }
 
-/// 获取配置文件路径：~/.me-api-proxy/apis.json
+#[derive(Clone)]
+struct RouteMatch {
+    target: String,
+    new_path: String,
+}
+
 fn get_config_path() -> PathBuf {
     let home = dirs::home_dir().expect("Cannot find home directory");
     home.join(".me-api-proxy").join("apis.json")
 }
 
-/// 从配置文件加载路由映射
-fn load_routes() -> HashMap<String, String> {
+fn ensure_default_config() {
     let config_path = get_config_path();
 
-    // 如果配置目录不存在，自动创建
     if let Some(parent) = config_path.parent() {
         if !parent.exists() {
             std::fs::create_dir_all(parent).expect("Failed to create config directory");
-            tracing::info!("Created config directory: {:?}", parent);
+            info!("Created config directory: {:?}", parent);
         }
     }
 
-    // 如果配置文件不存在，使用默认配置创建
     if !config_path.exists() {
         std::fs::write(&config_path, DEFAULT_CONFIG).expect("Failed to create config file");
-        tracing::info!("Created config file: {:?}", config_path);
+        info!("Created config file: {:?}", config_path);
     }
+}
 
-    // 读取并解析配置文件
+fn load_routes() -> HashMap<String, String> {
+    ensure_default_config();
+    let config_path = get_config_path();
     let content = std::fs::read_to_string(&config_path).expect("Failed to read config file");
     let json: Map<String, Value> =
         serde_json::from_str(&content).expect("Failed to parse config JSON");
 
-    // 将 JSON 对象转换为路由映射
     let mut routes = HashMap::new();
     for (key, value) in json {
         if let Some(url) = value.as_str() {
@@ -77,13 +96,131 @@ fn load_routes() -> HashMap<String, String> {
         }
     }
 
-    tracing::info!("Loaded {} routes from {:?}", routes.len(), config_path);
+    info!("Loaded {} routes from {:?}", routes.len(), config_path);
     routes
+}
+
+fn match_prefix(path: &str, prefix: &str) -> bool {
+    path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+fn find_target(path: &str, routes: &HashMap<String, String>) -> Option<RouteMatch> {
+    let mut best: Option<(usize, RouteMatch)> = None;
+
+    for (key, url) in routes {
+        let prefix = format!("/{}", key.trim_matches('/'));
+        if !match_prefix(path, &prefix) {
+            continue;
+        }
+
+        let suffix = &path[prefix.len()..];
+        let new_path = if suffix.is_empty() {
+            "/".to_string()
+        } else {
+            suffix.to_string()
+        };
+
+        let candidate = RouteMatch {
+            target: url.clone(),
+            new_path,
+        };
+
+        match &best {
+            Some((len, _)) if *len >= prefix.len() => {}
+            _ => best = Some((prefix.len(), candidate)),
+        }
+    }
+
+    best.map(|(_, value)| value)
+}
+
+fn build_upstream_url(target: &str, new_path: &str, query: Option<&str>) -> Result<Url, String> {
+    let mut parsed = Url::parse(target).map_err(|e| format!("Invalid upstream URL: {e}"))?;
+    let base_path = parsed.path().trim_end_matches('/');
+    let suffix = if new_path.starts_with('/') {
+        new_path.to_string()
+    } else {
+        format!("/{new_path}")
+    };
+    let combined_path = if base_path.is_empty() {
+        suffix
+    } else {
+        format!("{base_path}{suffix}")
+    };
+
+    parsed.set_path(if combined_path.is_empty() {
+        "/"
+    } else {
+        &combined_path
+    });
+    parsed.set_query(query);
+    Ok(parsed)
+}
+
+fn should_skip_header(name: &str, skipped: &[&str]) -> bool {
+    let lower = name.to_ascii_lowercase();
+    skipped.contains(&lower.as_str())
+}
+
+fn set_host_header(headers: &mut HeaderMap, authority: &str) -> Result<(), String> {
+    let value =
+        HeaderValue::from_str(authority).map_err(|e| format!("Invalid host header '{authority}': {e}"))?;
+    headers.insert(header::HOST, value);
+    Ok(())
+}
+
+fn filtered_headers(source: &HeaderMap, excluded: &[&str]) -> HeaderMap {
+    let mut headers = HeaderMap::new();
+    for (name, value) in source {
+        if !should_skip_header(name.as_str(), excluded) {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+    headers
+}
+
+fn extract_ws_protocols(headers: &HeaderMap) -> Vec<String> {
+    headers
+        .get_all("sec-websocket-protocol")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn is_websocket_request(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::UPGRADE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| value.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false)
+}
+
+fn websocket_url(target: &str, new_path: &str, query: Option<&str>) -> Result<Url, String> {
+    let mut url = build_upstream_url(target, new_path, query)?;
+    match url.scheme() {
+        "http" => url.set_scheme("ws").map_err(|_| "Failed to switch ws scheme".to_string())?,
+        "https" => url
+            .set_scheme("wss")
+            .map_err(|_| "Failed to switch wss scheme".to_string())?,
+        "ws" | "wss" => {}
+        scheme => return Err(format!("Unsupported websocket target scheme: {scheme}")),
+    }
+    Ok(url)
+}
+
+fn build_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .build()
+        .expect("Failed to build reqwest client")
 }
 
 #[tokio::main]
 async fn main() {
-    // 初始化日志系统，支持通过环境变量 RUST_LOG 控制日志级别
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -92,272 +229,249 @@ async fn main() {
         .init();
 
     let config_path = get_config_path();
-    let routes = load_routes();
     let state = AppState {
-        routes: Arc::new(RwLock::new(routes)),
+        routes: Arc::new(RwLock::new(load_routes())),
+        client: build_client(),
     };
 
-    // 启动配置热重载任务：每 5 秒检查配置文件是否有变更
-    let routes_clone = state.routes.clone();
-    let config_path_clone = config_path.clone();
+    let routes = state.routes.clone();
     tokio::spawn(async move {
         let mut last_modified: Option<SystemTime> = None;
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
-            if let Ok(meta) = std::fs::metadata(&config_path_clone) {
+            if let Ok(meta) = std::fs::metadata(&config_path) {
                 if let Ok(modified) = meta.modified() {
-                    // 检测文件修改时间是否变化
-                    if last_modified.is_none() || last_modified.unwrap() != modified {
+                    if last_modified != Some(modified) {
                         last_modified = Some(modified);
-                        // 重新加载配置并更新路由映射
-                        let new_routes = load_routes();
-                        *routes_clone.write().await = new_routes;
-                        tracing::info!("Config reloaded from {:?}", config_path_clone);
+                        *routes.write().await = load_routes();
+                        info!("Config reloaded from {:?}", config_path);
                     }
                 }
             }
         }
     });
 
-    // 构建路由：使用 fallback 处理所有请求，添加 HTTP 追踪中间件
     let app = Router::new()
         .fallback(proxy_handler)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
     let addr = "0.0.0.0:8080";
-    tracing::info!("Listening on {}", addr);
+    info!("Listening on {addr}");
 
-    // 启动 TCP 监听器并开始服务
     let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
 }
 
-/// 代理处理器：将请求转发到对应的上游服务器
-async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response {
+async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response<Body> {
     let path = req.uri().path().to_string();
-    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let query = req.uri().query().map(ToOwned::to_owned);
 
-    // 解析 URL 路径：第一段作为路由名称，剩余部分作为转发路径
-    // 例如：/newapis/v1/users -> 路由名=newapis, 转发路径=/v1/users
-    let segments: Vec<&str> = path.trim_start_matches('/').splitn(2, '/').collect();
-    let route_name = segments.first().unwrap_or(&"");
-    let remaining_path = if segments.len() > 1 {
-        format!("/{}", segments[1])
-    } else {
-        String::from("/")
-    };
-
-    // 查找对应的上游服务器地址
-    let upstream_base = {
+    let route_match = {
         let routes = state.routes.read().await;
-        routes.get(*route_name).cloned()
+        find_target(&path, &routes)
     };
 
-    // 如果路由不存在，返回 404 错误
-    let upstream_base = match upstream_base {
-        Some(url) => url,
-        None => {
-            return (
-                StatusCode::NOT_FOUND,
-                format!("Route '{}' not found. Available routes in ~/.me-api-proxy/apis.json", route_name),
-            )
-                .into_response();
-        }
+    let Some(route_match) = route_match else {
+        return (StatusCode::NOT_FOUND, "No target found").into_response();
     };
 
-    // 拼接完整的上游请求 URL
-    let full_url = format!(
-        "{}{}{}",
-        upstream_base.trim_end_matches('/'),
-        remaining_path,
-        query
-    );
+    if is_websocket_request(req.headers()) {
+        return proxy_websocket_request(state, req, route_match, query.as_deref()).await;
+    }
 
-    tracing::info!("{} {} -> {}", req.method(), path, full_url);
+    proxy_http_request(state, req, route_match, query.as_deref()).await
+}
 
-    // 拆分请求为头部和请求体
+async fn proxy_http_request(
+    state: AppState,
+    req: Request,
+    route_match: RouteMatch,
+    query: Option<&str>,
+) -> Response<Body> {
+    let upstream_url = match build_upstream_url(&route_match.target, &route_match.new_path, query) {
+        Ok(url) => url,
+        Err(err) => return (StatusCode::BAD_GATEWAY, err).into_response(),
+    };
+
+    info!("{} {} -> {}", req.method(), req.uri().path(), upstream_url);
+
+    let authority = upstream_url.authority().to_string();
+
     let (parts, body) = req.into_parts();
+    let mut headers = filtered_headers(&parts.headers, HOP_BY_HOP_HEADERS);
+    if let Err(err) = set_host_header(&mut headers, &authority) {
+        return (StatusCode::BAD_GATEWAY, err).into_response();
+    }
 
-    let request_body = match to_bytes(body, usize::MAX).await {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::error!("Failed to read request body: {}", e);
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("Failed to read request body: {}", e),
-            )
-                .into_response();
-        }
-    };
+    let mut builder = state.client.request(parts.method, upstream_url);
+    builder = builder.headers(headers);
+    builder = builder.body(reqwest::Body::wrap_stream(body.into_data_stream()));
 
-    let upstream = match send_via_curl(&parts.method, &parts.headers, &full_url, request_body).await
-    {
+    let upstream = match builder.send().await {
         Ok(response) => response,
-        Err(e) => {
-            tracing::error!("Upstream error: {}", e);
-            return (StatusCode::BAD_GATEWAY, format!("Upstream error: {}", e)).into_response();
+        Err(err) if err.is_timeout() => {
+            return (StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout").into_response();
+        }
+        Err(err) => {
+            error!("HTTP proxy error: {err}");
+            return (StatusCode::BAD_GATEWAY, format!("Bad Gateway: {err}")).into_response();
         }
     };
 
-    // 构建响应，保留上游服务器的状态码
-    let mut builder = Response::builder().status(upstream.status);
-
-    // 转发所有响应头，过滤掉逐跳头部
-    if let Some(headers) = builder.headers_mut() {
-        for (k, v) in &upstream.headers {
-            if !HOP_BY_HOP_HEADERS.contains(&k.as_str().to_lowercase().as_str()) {
-                headers.insert(k.clone(), v.clone());
+    let mut response = Response::builder().status(upstream.status());
+    if let Some(headers_mut) = response.headers_mut() {
+        for (name, value) in upstream.headers() {
+            if !should_skip_header(name.as_str(), HOP_BY_HOP_HEADERS) {
+                headers_mut.append(name.clone(), value.clone());
             }
         }
     }
 
-    builder
-        .body(Body::from(upstream.body))
-        .unwrap_or_else(|e| {
-            tracing::error!("Failed to build response: {}", e);
+    response
+        .body(Body::from_stream(upstream.bytes_stream()))
+        .unwrap_or_else(|err| {
+            error!("Failed to build upstream response: {err}");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         })
 }
 
-struct CurlResponse {
-    status: StatusCode,
-    headers: HeaderMap,
-    body: Vec<u8>,
+async fn proxy_websocket_request(
+    state: AppState,
+    req: Request,
+    route_match: RouteMatch,
+    query: Option<&str>,
+) -> Response<Body> {
+    let ws_url = match websocket_url(&route_match.target, &route_match.new_path, query) {
+        Ok(url) => url,
+        Err(err) => return (StatusCode::BAD_GATEWAY, err).into_response(),
+    };
+
+    let authority = ws_url.authority().to_string();
+
+    let protocols = extract_ws_protocols(req.headers());
+    let (mut parts, _) = req.into_parts();
+    let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
+        Ok(value) => value,
+        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
+    };
+
+    let response_protocols = protocols.clone();
+    upgrade
+        .protocols(response_protocols)
+        .on_upgrade(move |socket| async move {
+            if let Err(err) = proxy_websocket(socket, ws_url, authority, parts.headers, protocols).await
+            {
+                error!("WebSocket proxy error: {err}");
+            }
+        })
 }
 
-async fn send_via_curl(
-    method: &axum::http::Method,
-    headers: &HeaderMap,
-    url: &str,
-    body: Bytes,
-) -> Result<CurlResponse, String> {
-    let nonce = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_err(|e| e.to_string())?
-        .as_nanos();
-    let tmp_dir = std::env::temp_dir();
-    let header_path = tmp_dir.join(format!("me-api-proxy-{nonce}.headers"));
-    let body_path = tmp_dir.join(format!("me-api-proxy-{nonce}.body"));
+async fn proxy_websocket(
+    downstream: WebSocket,
+    ws_url: Url,
+    authority: String,
+    request_headers: HeaderMap,
+    protocols: Vec<String>,
+) -> Result<(), String> {
+    let mut client_request = ws_url
+        .as_str()
+        .into_client_request()
+        .map_err(|e| format!("Failed to build websocket request: {e}"))?;
 
-    let mut command = Command::new("curl");
-    command
-        .arg("--silent")
-        .arg("--show-error")
-        .arg("--http1.1")
-        .arg("--request")
-        .arg(method.as_str())
-        .arg("--url")
-        .arg(url)
-        .arg("--dump-header")
-        .arg(&header_path)
-        .arg("--output")
-        .arg(&body_path)
-        .stderr(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null());
-
-    for (key, value) in headers {
-        if should_forward_request_header(key.as_str()) {
-            let value = value
-                .to_str()
-                .map_err(|e| format!("Invalid header {}: {}", key.as_str(), e))?;
-            command.arg("-H").arg(format!("{}: {}", key.as_str(), value));
+    {
+        let headers = client_request.headers_mut();
+        for (name, value) in filtered_headers(&request_headers, WS_HANDSHAKE_HEADERS).iter() {
+            headers.append(name.clone(), value.clone());
+        }
+        set_host_header(headers, &authority)?;
+        if !protocols.is_empty() {
+            let value = HeaderValue::from_str(&protocols.join(", "))
+                .map_err(|e| format!("Invalid Sec-WebSocket-Protocol header: {e}"))?;
+            headers.insert("Sec-WebSocket-Protocol", value);
         }
     }
 
-    if body.is_empty() {
-        command.stdin(std::process::Stdio::null());
-    } else {
-        command.arg("--data-binary").arg("@-");
-        command.stdin(std::process::Stdio::piped());
-    }
+    let (upstream, _) = tokio_tungstenite::connect_async(client_request)
+        .await
+        .map_err(|e| format!("Upstream websocket connect failed: {e}"))?;
 
-    let mut child = command
-        .spawn()
-        .map_err(|e| format!("Failed to spawn curl: {}", e))?;
+    let (mut downstream_sink, mut downstream_stream) = downstream.split();
+    let (mut upstream_sink, mut upstream_stream) = upstream.split();
 
-    if !body.is_empty() {
-        if let Some(mut stdin) = child.stdin.take() {
-            stdin
-                .write_all(&body)
-                .await
-                .map_err(|e| format!("Failed to write request body to curl: {}", e))?;
+    let client_to_upstream = async {
+        while let Some(message) = downstream_stream.next().await {
+            let message = message.map_err(|e| e.to_string())?;
+            match message {
+                Message::Text(text) => upstream_sink
+                    .send(WsMessage::Text(text.to_string().into()))
+                    .await
+                    .map_err(|e| e.to_string())?,
+                Message::Binary(data) => upstream_sink
+                    .send(WsMessage::Binary(data))
+                    .await
+                    .map_err(|e| e.to_string())?,
+                Message::Ping(data) => upstream_sink
+                    .send(WsMessage::Ping(data))
+                    .await
+                    .map_err(|e| e.to_string())?,
+                Message::Pong(data) => upstream_sink
+                    .send(WsMessage::Pong(data))
+                    .await
+                    .map_err(|e| e.to_string())?,
+                Message::Close(frame) => {
+                    let frame = frame.map(|frame| WsCloseFrame {
+                        code: WsCloseCode::from(u16::from(frame.code)),
+                        reason: frame.reason.to_string().into(),
+                    });
+                    upstream_sink
+                        .send(WsMessage::Close(frame))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    break;
+                }
+            }
         }
-    }
+        Ok::<(), String>(())
+    };
 
-    let output = child
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("Failed to wait for curl: {}", e))?;
-
-    let raw_headers = tokio::fs::read(&header_path)
-        .await
-        .map_err(|e| format!("Failed to read curl response headers: {}", e))?;
-    let response_body = tokio::fs::read(&body_path)
-        .await
-        .map_err(|e| format!("Failed to read curl response body: {}", e))?;
-
-    let _ = tokio::fs::remove_file(&header_path).await;
-    let _ = tokio::fs::remove_file(&body_path).await;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("curl exited with {}: {}", output.status, stderr.trim()));
-    }
-
-    let (status, headers) = parse_curl_headers(&raw_headers)?;
-
-    Ok(CurlResponse {
-        status,
-        headers,
-        body: response_body,
-    })
-}
-
-fn should_forward_request_header(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    lower != "host"
-        && lower != "content-length"
-        && !HOP_BY_HOP_HEADERS.contains(&lower.as_str())
-}
-
-fn parse_curl_headers(raw: &[u8]) -> Result<(StatusCode, HeaderMap), String> {
-    let normalized = String::from_utf8_lossy(raw).replace("\r\n", "\n");
-    let block = normalized
-        .split("\n\n")
-        .filter(|block| block.trim_start().starts_with("HTTP/"))
-        .last()
-        .ok_or_else(|| "curl did not return HTTP response headers".to_string())?;
-
-    let mut lines = block.lines();
-    let status_line = lines
-        .next()
-        .ok_or_else(|| "curl response headers missing status line".to_string())?;
-    let status_code = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| format!("Invalid status line from curl: {}", status_line))?
-        .parse::<u16>()
-        .map_err(|e| format!("Invalid status code from curl: {}", e))?;
-    let status =
-        StatusCode::from_u16(status_code).map_err(|e| format!("Invalid HTTP status: {}", e))?;
-
-    let mut headers = HeaderMap::new();
-    for line in lines {
-        let line = line.trim_end();
-        if line.is_empty() {
-            continue;
+    let upstream_to_client = async {
+        while let Some(message) = upstream_stream.next().await {
+            let message = message.map_err(|e| e.to_string())?;
+            match message {
+                WsMessage::Text(text) => downstream_sink
+                    .send(Message::Text(text.to_string().into()))
+                    .await
+                    .map_err(|e| e.to_string())?,
+                WsMessage::Binary(data) => downstream_sink
+                    .send(Message::Binary(data))
+                    .await
+                    .map_err(|e| e.to_string())?,
+                WsMessage::Ping(data) => downstream_sink
+                    .send(Message::Ping(data))
+                    .await
+                    .map_err(|e| e.to_string())?,
+                WsMessage::Pong(data) => downstream_sink
+                    .send(Message::Pong(data))
+                    .await
+                    .map_err(|e| e.to_string())?,
+                WsMessage::Close(frame) => {
+                    let frame = frame.map(|frame| CloseFrame {
+                        code: u16::from(frame.code).into(),
+                        reason: frame.reason.to_string().into(),
+                    });
+                    downstream_sink
+                        .send(Message::Close(frame))
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    break;
+                }
+                WsMessage::Frame(_) => {}
+            }
         }
+        Ok::<(), String>(())
+    };
 
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| format!("Invalid response header line: {}", line))?;
-        let name = HeaderName::from_bytes(name.trim().as_bytes())
-            .map_err(|e| format!("Invalid response header name '{}': {}", name.trim(), e))?;
-        let value = HeaderValue::from_str(value.trim())
-            .map_err(|e| format!("Invalid response header value for '{}': {}", name, e))?;
-        headers.append(name, value);
-    }
-
-    Ok((status, headers))
+    let _ = tokio::join!(client_to_upstream, upstream_to_client);
+    Ok(())
 }
