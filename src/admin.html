@@ -13,6 +13,7 @@
       --accent: #2563eb;
       --accent-strong: #1d4ed8;
       --danger: #dc2626;
+      --warn: #b45309;
       --border: #e5e7eb;
       --soft: #f9fafb;
     }
@@ -30,7 +31,7 @@
     }
 
     .shell {
-      max-width: 880px;
+      max-width: 920px;
       margin: 0 auto;
       padding: 20px 16px 28px;
     }
@@ -52,6 +53,11 @@
       font-weight: 700;
     }
 
+    h2 {
+      margin: 0;
+      font-size: 14px;
+    }
+
     .hint {
       margin: 4px 0 0;
       color: var(--muted);
@@ -59,7 +65,8 @@
       line-height: 1.6;
     }
 
-    .status-pill {
+    .status-pill,
+    .tag {
       display: inline-flex;
       align-items: center;
       padding: 4px 8px;
@@ -69,20 +76,31 @@
       white-space: nowrap;
     }
 
-    .status-pill.enabled {
+    .status-pill.enabled,
+    .tag.ok {
       color: var(--accent-strong);
       background: #eff6ff;
     }
 
-    .status-pill.disabled {
+    .status-pill.disabled,
+    .tag.bad {
       color: var(--danger);
       background: #fef2f2;
+    }
+
+    .tag.warn {
+      color: var(--warn);
+      background: #fff7ed;
     }
 
     .panel {
       background: var(--panel);
       border: 1px solid var(--border);
       border-radius: 10px;
+    }
+
+    .panel + .panel {
+      margin-top: 12px;
     }
 
     .panel-body {
@@ -102,7 +120,7 @@
     }
 
     input[type="url"],
-    input[type="text"],
+    textarea,
     select {
       width: 100%;
       padding: 9px 10px;
@@ -112,6 +130,13 @@
       color: var(--text);
       font: inherit;
       line-height: 1.5;
+    }
+
+    textarea {
+      min-height: 128px;
+      resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
     }
 
     .grid {
@@ -136,10 +161,16 @@
       accent-color: var(--accent);
     }
 
-    .actions {
+    .actions,
+    .section-head {
       display: flex;
       align-items: center;
       gap: 10px;
+      justify-content: space-between;
+    }
+
+    .actions {
+      justify-content: flex-start;
       padding-top: 2px;
     }
 
@@ -153,6 +184,11 @@
       cursor: pointer;
       background: var(--accent);
       color: #fff;
+    }
+
+    button.secondary {
+      background: #eef2ff;
+      color: #3730a3;
     }
 
     button:disabled {
@@ -172,6 +208,47 @@
 
     .message.error {
       color: var(--danger);
+    }
+
+    .summary {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+
+    .key-list {
+      margin-top: 12px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .key-row {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 10px;
+      align-items: center;
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--soft);
+      font-size: 12px;
+    }
+
+    .key-name {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      overflow-wrap: anywhere;
+    }
+
+    .empty {
+      margin-top: 12px;
+      padding: 14px;
+      border: 1px dashed var(--border);
+      border-radius: 8px;
+      color: var(--muted);
+      background: var(--soft);
+      font-size: 12px;
+      text-align: center;
     }
 
     .endpoints {
@@ -200,7 +277,8 @@
 
     @media (max-width: 720px) {
       .header,
-      .endpoint {
+      .endpoint,
+      .key-row {
         display: grid;
         align-items: start;
       }
@@ -216,7 +294,7 @@
     <header class="header">
       <div>
         <h1>OpenAI 代理配置</h1>
-        <p class="hint">只需配置 Base URL 和 API Key。代理会对外提供标准 OpenAI 接口，并自动替换上游鉴权。</p>
+        <p class="hint">配置上游 Base URL、协议能力和 API Key 池。代理对外始终提供 Chat 与 Responses 接口。</p>
       </div>
       <span id="state-pill" class="status-pill disabled">未启用</span>
     </header>
@@ -227,21 +305,23 @@
           <label>
             Base URL
             <input id="base_url" type="url" placeholder="https://api.openai.com" required />
+            <span class="hint">填写服务根地址即可，带不带 /v1 都可以。</span>
           </label>
 
           <label>
-            API Key
-            <input id="api_key" type="text" placeholder="sk-..." required />
+            API Keys
+            <textarea id="api_keys" placeholder="每行一个 API Key，例如 sk-..."></textarea>
           </label>
 
           <div class="grid">
             <label>
-              协议支持
+              上游协议
               <select id="protocol_mode">
-                <option value="both">Chat + Responses</option>
-                <option value="chat">仅 Chat Completions</option>
-                <option value="responses">仅 Responses</option>
+                <option value="both">上游支持 Chat + Responses</option>
+                <option value="chat">上游仅支持 Chat Completions</option>
+                <option value="responses">上游仅支持 Responses</option>
               </select>
+              <span class="hint">如果上游只支持一种协议，代理会自动转换另一种入站协议。</span>
             </label>
 
             <label class="checkbox">
@@ -255,6 +335,17 @@
             <span id="message" class="message"></span>
           </div>
         </form>
+      </div>
+    </section>
+
+    <section class="panel">
+      <div class="panel-body">
+        <div class="section-head">
+          <h2>Key 状态</h2>
+          <button id="unban-all-btn" class="secondary" type="button">全部解禁</button>
+        </div>
+        <div id="key-summary" class="summary"></div>
+        <div id="key-list" class="key-list"></div>
       </div>
     </section>
 
@@ -273,12 +364,15 @@
   <script>
     const form = document.getElementById("config-form");
     const baseUrlInput = document.getElementById("base_url");
-    const apiKeyInput = document.getElementById("api_key");
+    const apiKeysInput = document.getElementById("api_keys");
     const protocolModeInput = document.getElementById("protocol_mode");
     const enabledInput = document.getElementById("enabled");
     const saveBtn = document.getElementById("save-btn");
     const messageEl = document.getElementById("message");
     const statePill = document.getElementById("state-pill");
+    const keySummary = document.getElementById("key-summary");
+    const keyList = document.getElementById("key-list");
+    const unbanAllBtn = document.getElementById("unban-all-btn");
 
     function setMessage(text, type = "") {
       messageEl.textContent = text || "";
@@ -295,17 +389,68 @@
       statePill.className = `status-pill ${enabled ? "enabled" : "disabled"}`;
     }
 
+    function parseApiKeys() {
+      return apiKeysInput.value
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+    }
+
+    function formatTime(timestamp) {
+      if (!timestamp) return "-";
+      return new Date(timestamp * 1000).toLocaleString();
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#039;");
+    }
+
+    function fileModeMessage() {
+      return "当前是直接打开 HTML 文件，无法连接管理 API。请先启动服务，然后访问 http://127.0.0.1:8080/admin。";
+    }
+
+    function friendlyFetchError(error) {
+      if (location.protocol === "file:") {
+        return fileModeMessage();
+      }
+      if (error && error.message === "Failed to fetch") {
+        return "无法连接管理 API，请确认代理服务已启动，并从 /admin 页面访问。";
+      }
+      return error && error.message ? error.message : "请求失败";
+    }
+
     async function request(url, options = {}) {
-      const response = await fetch(url, {
-        headers: {
-          "Content-Type": "application/json",
-          ...(options.headers || {}),
-        },
-        ...options,
-      });
+      if (location.protocol === "file:") {
+        throw new Error(fileModeMessage());
+      }
+
+      let response;
+      try {
+        response = await fetch(url, {
+          headers: {
+            "Content-Type": "application/json",
+            ...(options.headers || {}),
+          },
+          ...options,
+        });
+      } catch (error) {
+        throw new Error(friendlyFetchError(error));
+      }
 
       const text = await response.text();
-      const data = text ? JSON.parse(text) : null;
+      let data = null;
+      if (text) {
+        try {
+          data = JSON.parse(text);
+        } catch (_) {
+          data = { error: text };
+        }
+      }
 
       if (!response.ok) {
         throw new Error((data && data.error) || `请求失败：${response.status}`);
@@ -316,10 +461,39 @@
 
     function fillForm(config) {
       baseUrlInput.value = config.base_url || "";
-      apiKeyInput.value = config.api_key || "";
+      apiKeysInput.value = (config.api_keys || []).join("\n");
       protocolModeInput.value = config.protocol_mode || "both";
       enabledInput.checked = Boolean(config.enabled);
       renderState(Boolean(config.enabled));
+      renderKeyStatus(config.key_statuses || []);
+    }
+
+    function renderKeyStatus(statuses) {
+      const total = statuses.length;
+      const banned = statuses.filter((item) => item.banned).length;
+      const totalFailures = statuses.reduce((sum, item) => sum + (item.fail_count || 0), 0);
+      const available = total - banned;
+
+      keySummary.innerHTML = `
+        <span class="tag ok">可用 ${available}/${total}</span>
+        <span class="tag bad">封禁 ${banned}</span>
+        <span class="tag warn">总失败 ${totalFailures} 次</span>
+      `;
+
+      if (!statuses.length) {
+        keyList.innerHTML = '<div class="empty">暂无 API Key</div>';
+        return;
+      }
+
+      keyList.innerHTML = statuses.map((item) => `
+        <div class="key-row">
+          <span class="key-name">${item.index + 1}. ${escapeHtml(item.masked_key)}</span>
+          <span class="tag ${item.banned ? "bad" : item.fail_count > 0 ? "warn" : "ok"}">
+            ${item.banned ? `已封禁至 ${formatTime(item.ban_until)}` : item.fail_count > 0 ? `失败 ${item.fail_count} 次` : "正常"}
+          </span>
+          <button class="secondary" type="button" data-unban="${item.index}" ${item.fail_count === 0 && !item.banned ? "disabled" : ""}>解禁</button>
+        </div>
+      `).join("");
     }
 
     async function loadConfig() {
@@ -337,12 +511,12 @@
           method: "PUT",
           body: JSON.stringify({
             base_url: baseUrlInput.value,
-            api_key: apiKeyInput.value,
+            api_keys: parseApiKeys(),
             protocol_mode: protocolModeInput.value,
             enabled: enabledInput.checked,
           }),
         });
-        renderState(enabledInput.checked);
+        await loadConfig();
         setMessage("已保存。", "success");
       } catch (error) {
         setMessage(error.message, "error");
@@ -351,8 +525,34 @@
       }
     });
 
+    keyList.addEventListener("click", async (event) => {
+      const button = event.target.closest("button[data-unban]");
+      if (!button) return;
+      button.disabled = true;
+      try {
+        await request(`/admin/api/keys/${button.dataset.unban}/unban`, { method: "POST" });
+        await loadConfig();
+        setMessage("已解禁。", "success");
+      } catch (error) {
+        setMessage(error.message, "error");
+      }
+    });
+
+    unbanAllBtn.addEventListener("click", async () => {
+      unbanAllBtn.disabled = true;
+      try {
+        await request("/admin/api/keys/unban-all", { method: "POST" });
+        await loadConfig();
+        setMessage("已全部解禁。", "success");
+      } catch (error) {
+        setMessage(error.message, "error");
+      } finally {
+        unbanAllBtn.disabled = false;
+      }
+    });
+
     loadConfig().catch((error) => {
-      setMessage(error.message, "error");
+      setMessage(friendlyFetchError(error), "error");
     });
   </script>
 </body>
