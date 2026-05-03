@@ -1,31 +1,28 @@
 use axum::{
-    body::Body,
-    extract::{
-        ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
-        FromRequestParts, Request, State,
-    },
-    http::{header, HeaderMap, HeaderValue, Response, StatusCode},
-    response::IntoResponse,
+    body::{to_bytes, Body},
+    extract::{Json, Request, State},
+    http::{header, HeaderMap, HeaderValue, Method, Response, StatusCode},
+    middleware::{self, Next},
+    response::{Html, IntoResponse},
+    routing::{get, put},
     Router,
 };
-use futures_util::{sink::SinkExt, stream::StreamExt};
-use serde_json::{Map, Value};
-use std::collections::HashMap;
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use rusqlite::{params, Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 use tokio::sync::RwLock;
-use tokio_tungstenite::tungstenite::{
-    client::IntoClientRequest,
-    protocol::{frame::coding::CloseCode as WsCloseCode, CloseFrame as WsCloseFrame, Message as WsMessage},
-};
 use tower_http::trace::TraceLayer;
 use tracing::{error, info};
 use url::Url;
 
-const DEFAULT_CONFIG: &str = r#"{
-  "newapis": "https://newapis.xyz"
-}"#;
+const ADMIN_HTML: &str = include_str!("admin.html");
+const MAX_REQUEST_BODY_BYTES: usize = 20 * 1024 * 1024;
+const CHAT_PATH: &str = "/v1/chat/completions";
+const RESPONSES_PATH: &str = "/v1/responses";
 
 const HOP_BY_HOP_HEADERS: &[&str] = &[
     "connection",
@@ -39,121 +36,261 @@ const HOP_BY_HOP_HEADERS: &[&str] = &[
     "upgrade",
 ];
 
-const WS_HANDSHAKE_HEADERS: &[&str] = &[
-    "host",
-    "connection",
-    "upgrade",
-    "sec-websocket-key",
-    "sec-websocket-version",
-    "sec-websocket-extensions",
-];
-
 #[derive(Clone)]
 struct AppState {
-    routes: Arc<RwLock<HashMap<String, String>>>,
+    config: Arc<RwLock<OpenAiConfig>>,
     client: reqwest::Client,
+    db_path: PathBuf,
+    admin: AdminCredentials,
 }
 
 #[derive(Clone)]
-struct RouteMatch {
-    target: String,
-    new_path: String,
+struct AdminCredentials {
+    username: String,
+    password: String,
 }
 
-fn get_config_path() -> PathBuf {
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ProtocolMode {
+    Chat,
+    Responses,
+    Both,
+}
+
+impl ProtocolMode {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Responses => "responses",
+            Self::Both => "both",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, String> {
+        match value {
+            "chat" => Ok(Self::Chat),
+            "responses" => Ok(Self::Responses),
+            "both" => Ok(Self::Both),
+            _ => Err("protocol_mode must be chat, responses, or both".to_string()),
+        }
+    }
+
+    fn supports(&self, path: &str) -> bool {
+        matches!(
+            (self, path),
+            (Self::Chat, CHAT_PATH)
+                | (Self::Responses, RESPONSES_PATH)
+                | (Self::Both, CHAT_PATH)
+                | (Self::Both, RESPONSES_PATH)
+        )
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct OpenAiConfig {
+    base_url: String,
+    api_key: String,
+    protocol_mode: ProtocolMode,
+    enabled: bool,
+}
+
+impl Default for OpenAiConfig {
+    fn default() -> Self {
+        Self {
+            base_url: String::new(),
+            api_key: String::new(),
+            protocol_mode: ProtocolMode::Both,
+            enabled: false,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ErrorResponse {
+    error: String,
+}
+
+fn get_config_dir() -> PathBuf {
     let home = dirs::home_dir().expect("Cannot find home directory");
-    home.join(".me-api-proxy").join("apis.json")
+    home.join(".me-api-proxy")
 }
 
-fn ensure_default_config() {
-    let config_path = get_config_path();
+fn get_db_path() -> PathBuf {
+    get_config_dir().join("config.db")
+}
 
-    if let Some(parent) = config_path.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent).expect("Failed to create config directory");
-            info!("Created config directory: {:?}", parent);
-        }
-    }
-
-    if !config_path.exists() {
-        std::fs::write(&config_path, DEFAULT_CONFIG).expect("Failed to create config file");
-        info!("Created config file: {:?}", config_path);
+fn ensure_config_dir() {
+    let config_dir = get_config_dir();
+    if !config_dir.exists() {
+        std::fs::create_dir_all(&config_dir).expect("Failed to create config directory");
+        info!("Created config directory: {:?}", config_dir);
     }
 }
 
-fn load_routes() -> HashMap<String, String> {
-    ensure_default_config();
-    let config_path = get_config_path();
-    let content = std::fs::read_to_string(&config_path).expect("Failed to read config file");
-    let json: Map<String, Value> =
-        serde_json::from_str(&content).expect("Failed to parse config JSON");
-
-    let mut routes = HashMap::new();
-    for (key, value) in json {
-        if let Some(url) = value.as_str() {
-            routes.insert(key, url.to_string());
-        }
-    }
-
-    info!("Loaded {} routes from {:?}", routes.len(), config_path);
-    routes
+fn open_db(path: &PathBuf) -> Result<Connection, String> {
+    let conn = Connection::open(path).map_err(|err| format!("Failed to open database: {err}"))?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")
+        .map_err(|err| format!("Failed to enable foreign keys: {err}"))?;
+    Ok(conn)
 }
 
-fn match_prefix(path: &str, prefix: &str) -> bool {
-    path == prefix || path.starts_with(&format!("{prefix}/"))
+fn init_database(path: &PathBuf) -> Result<(), String> {
+    let conn = open_db(path)?;
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS openai_config (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            base_url TEXT NOT NULL DEFAULT '',
+            api_key TEXT NOT NULL DEFAULT '',
+            protocol_mode TEXT NOT NULL DEFAULT 'both',
+            enabled INTEGER NOT NULL DEFAULT 0,
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+        );
+
+        INSERT OR IGNORE INTO openai_config (id, base_url, api_key, protocol_mode, enabled)
+        VALUES (1, '', '', 'both', 0);
+        ",
+    )
+    .map_err(|err| format!("Failed to initialize database: {err}"))?;
+    Ok(())
 }
 
-fn find_target(path: &str, routes: &HashMap<String, String>) -> Option<RouteMatch> {
-    let mut best: Option<(usize, RouteMatch)> = None;
+fn load_config(path: &PathBuf) -> Result<OpenAiConfig, String> {
+    let conn = open_db(path)?;
+    let row = conn
+        .query_row(
+            "SELECT base_url, api_key, protocol_mode, enabled FROM openai_config WHERE id = 1",
+            [],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|err| format!("Failed to load config: {err}"))?;
 
-    for (key, url) in routes {
-        let prefix = format!("/{}", key.trim_matches('/'));
-        if !match_prefix(path, &prefix) {
-            continue;
-        }
-
-        let suffix = &path[prefix.len()..];
-        let new_path = if suffix.is_empty() {
-            "/".to_string()
-        } else {
-            suffix.to_string()
-        };
-
-        let candidate = RouteMatch {
-            target: url.clone(),
-            new_path,
-        };
-
-        match &best {
-            Some((len, _)) if *len >= prefix.len() => {}
-            _ => best = Some((prefix.len(), candidate)),
-        }
-    }
-
-    best.map(|(_, value)| value)
-}
-
-fn build_upstream_url(target: &str, new_path: &str, query: Option<&str>) -> Result<Url, String> {
-    let mut parsed = Url::parse(target).map_err(|e| format!("Invalid upstream URL: {e}"))?;
-    let base_path = parsed.path().trim_end_matches('/');
-    let suffix = if new_path.starts_with('/') {
-        new_path.to_string()
-    } else {
-        format!("/{new_path}")
-    };
-    let combined_path = if base_path.is_empty() {
-        suffix
-    } else {
-        format!("{base_path}{suffix}")
+    let Some((base_url, api_key, protocol_mode, enabled)) = row else {
+        return Ok(OpenAiConfig::default());
     };
 
-    parsed.set_path(if combined_path.is_empty() {
-        "/"
-    } else {
-        &combined_path
-    });
-    parsed.set_query(query);
-    Ok(parsed)
+    Ok(OpenAiConfig {
+        base_url,
+        api_key,
+        protocol_mode: ProtocolMode::from_str(&protocol_mode)?,
+        enabled,
+    })
+}
+
+fn save_config(path: &PathBuf, config: &OpenAiConfig) -> Result<(), String> {
+    let conn = open_db(path)?;
+    conn.execute(
+        "UPDATE openai_config
+         SET base_url = ?1,
+             api_key = ?2,
+             protocol_mode = ?3,
+             enabled = ?4,
+             updated_at = strftime('%s', 'now')
+         WHERE id = 1",
+        params![
+            config.base_url,
+            config.api_key,
+            config.protocol_mode.as_str(),
+            if config.enabled { 1 } else { 0 }
+        ],
+    )
+    .map_err(|err| format!("Failed to save config: {err}"))?;
+    Ok(())
+}
+
+fn validate_config(config: OpenAiConfig) -> Result<OpenAiConfig, String> {
+    let base_url = config.base_url.trim().trim_end_matches('/').to_string();
+    let api_key = config.api_key.trim().to_string();
+
+    if base_url.is_empty() {
+        return Err("base_url must not be empty".to_string());
+    }
+    if api_key.is_empty() {
+        return Err("api_key must not be empty".to_string());
+    }
+
+    let parsed = Url::parse(&base_url).map_err(|err| format!("invalid base_url: {err}"))?;
+    match parsed.scheme() {
+        "http" | "https" => {}
+        scheme => return Err(format!("unsupported base_url scheme: {scheme}")),
+    }
+
+    Ok(OpenAiConfig {
+        base_url,
+        api_key,
+        protocol_mode: config.protocol_mode,
+        enabled: config.enabled,
+    })
+}
+
+fn build_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(30))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("Failed to build reqwest client")
+}
+
+fn load_admin_credentials() -> Result<AdminCredentials, String> {
+    let username =
+        std::env::var("ADMIN_USERNAME").map_err(|_| "ADMIN_USERNAME is required".to_string())?;
+    let password =
+        std::env::var("ADMIN_PASSWORD").map_err(|_| "ADMIN_PASSWORD is required".to_string())?;
+
+    if username.is_empty() || password.is_empty() {
+        return Err("ADMIN_USERNAME and ADMIN_PASSWORD must not be empty".to_string());
+    }
+
+    Ok(AdminCredentials { username, password })
+}
+
+fn parse_basic_auth(headers: &HeaderMap) -> Option<(String, String)> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let encoded = value.strip_prefix("Basic ")?;
+    let decoded = BASE64.decode(encoded).ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (username, password) = decoded.split_once(':')?;
+    Some((username.to_string(), password.to_string()))
+}
+
+fn unauthorized_response() -> Response<Body> {
+    let mut response = (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static(r#"Basic realm="me-api-proxy-admin""#),
+    );
+    response
+}
+
+async fn admin_auth(State(state): State<AppState>, req: Request, next: Next) -> Response<Body> {
+    let Some((username, password)) = parse_basic_auth(req.headers()) else {
+        return unauthorized_response();
+    };
+
+    if username != state.admin.username || password != state.admin.password {
+        return unauthorized_response();
+    }
+
+    next.run(req).await
+}
+
+fn json_error(status: StatusCode, message: impl Into<String>) -> Response<Body> {
+    (
+        status,
+        Json(ErrorResponse {
+            error: message.into(),
+        }),
+    )
+        .into_response()
 }
 
 fn should_skip_header(name: &str, skipped: &[&str]) -> bool {
@@ -162,158 +299,151 @@ fn should_skip_header(name: &str, skipped: &[&str]) -> bool {
 }
 
 fn set_host_header(headers: &mut HeaderMap, authority: &str) -> Result<(), String> {
-    let value =
-        HeaderValue::from_str(authority).map_err(|e| format!("Invalid host header '{authority}': {e}"))?;
+    let value = HeaderValue::from_str(authority)
+        .map_err(|e| format!("Invalid host header '{authority}': {e}"))?;
     headers.insert(header::HOST, value);
     Ok(())
 }
 
-fn filtered_headers(source: &HeaderMap, excluded: &[&str]) -> HeaderMap {
+fn build_upstream_headers(
+    source: &HeaderMap,
+    authority: &str,
+    api_key: &str,
+) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
     for (name, value) in source {
-        if !should_skip_header(name.as_str(), excluded) {
+        if !should_skip_header(name.as_str(), HOP_BY_HOP_HEADERS)
+            && !name.as_str().eq_ignore_ascii_case("host")
+            && !name.as_str().eq_ignore_ascii_case("authorization")
+        {
             headers.append(name.clone(), value.clone());
         }
     }
-    headers
+
+    set_host_header(&mut headers, authority)?;
+    let auth = HeaderValue::from_str(&format!("Bearer {api_key}"))
+        .map_err(|err| format!("Invalid upstream authorization header: {err}"))?;
+    headers.insert(header::AUTHORIZATION, auth);
+    Ok(headers)
 }
 
-fn extract_ws_protocols(headers: &HeaderMap) -> Vec<String> {
-    headers
-        .get_all("sec-websocket-protocol")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn is_websocket_request(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::UPGRADE)
-        .and_then(|value| value.to_str().ok())
-        .map(|value| value.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false)
-}
-
-fn websocket_url(target: &str, new_path: &str, query: Option<&str>) -> Result<Url, String> {
-    let mut url = build_upstream_url(target, new_path, query)?;
-    match url.scheme() {
-        "http" => url.set_scheme("ws").map_err(|_| "Failed to switch ws scheme".to_string())?,
-        "https" => url
-            .set_scheme("wss")
-            .map_err(|_| "Failed to switch wss scheme".to_string())?,
-        "ws" | "wss" => {}
-        scheme => return Err(format!("Unsupported websocket target scheme: {scheme}")),
-    }
-    Ok(url)
-}
-
-fn build_client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(30))
-        .build()
-        .expect("Failed to build reqwest client")
-}
-
-#[tokio::main]
-async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "me_api_proxy=info,tower_http=info".into()),
-        )
-        .init();
-
-    let config_path = get_config_path();
-    let state = AppState {
-        routes: Arc::new(RwLock::new(load_routes())),
-        client: build_client(),
+fn build_upstream_url(base_url: &str, path: &str, query: Option<&str>) -> Result<Url, String> {
+    let mut parsed = Url::parse(base_url).map_err(|err| format!("Invalid base_url: {err}"))?;
+    let base_path = parsed.path().trim_end_matches('/');
+    let combined_path = if base_path.is_empty() {
+        path.to_string()
+    } else {
+        format!("{base_path}{path}")
     };
 
-    let routes = state.routes.clone();
-    tokio::spawn(async move {
-        let mut last_modified: Option<SystemTime> = None;
-        loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            if let Ok(meta) = std::fs::metadata(&config_path) {
-                if let Ok(modified) = meta.modified() {
-                    if last_modified != Some(modified) {
-                        last_modified = Some(modified);
-                        *routes.write().await = load_routes();
-                        info!("Config reloaded from {:?}", config_path);
-                    }
-                }
-            }
-        }
-    });
-
-    let app = Router::new()
-        .fallback(proxy_handler)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
-
-    let addr = "0.0.0.0:8080";
-    info!("Listening on {addr}");
-
-    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    parsed.set_path(&combined_path);
+    parsed.set_query(query);
+    Ok(parsed)
 }
 
-async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response<Body> {
-    let path = req.uri().path().to_string();
-    let query = req.uri().query().map(ToOwned::to_owned);
-
-    let route_match = {
-        let routes = state.routes.read().await;
-        find_target(&path, &routes)
-    };
-
-    let Some(route_match) = route_match else {
-        return (StatusCode::NOT_FOUND, "No target found").into_response();
-    };
-
-    if is_websocket_request(req.headers()) {
-        return proxy_websocket_request(state, req, route_match, query.as_deref()).await;
-    }
-
-    proxy_http_request(state, req, route_match, query.as_deref()).await
+async fn admin_page() -> Html<&'static str> {
+    Html(ADMIN_HTML)
 }
 
-async fn proxy_http_request(
-    state: AppState,
-    req: Request,
-    route_match: RouteMatch,
-    query: Option<&str>,
+async fn get_config(State(state): State<AppState>) -> Json<OpenAiConfig> {
+    Json(state.config.read().await.clone())
+}
+
+async fn update_config(
+    State(state): State<AppState>,
+    Json(payload): Json<OpenAiConfig>,
 ) -> Response<Body> {
-    let upstream_url = match build_upstream_url(&route_match.target, &route_match.new_path, query) {
+    let config = match validate_config(payload) {
+        Ok(config) => config,
+        Err(err) => return json_error(StatusCode::BAD_REQUEST, err),
+    };
+
+    if let Err(err) = save_config(&state.db_path, &config) {
+        error!("Failed to save config: {err}");
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
+    }
+
+    *state.config.write().await = config;
+    Json(json!({ "ok": true })).into_response()
+}
+
+fn protocol_name(path: &str) -> &'static str {
+    match path {
+        CHAT_PATH => "chat",
+        RESPONSES_PATH => "responses",
+        _ => "unknown",
+    }
+}
+
+async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<Body> {
+    if req.method() != Method::POST {
+        return (StatusCode::METHOD_NOT_ALLOWED, "Method Not Allowed").into_response();
+    }
+
+    let path = req.uri().path().to_string();
+    if path != CHAT_PATH && path != RESPONSES_PATH {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
+
+    let config = state.config.read().await.clone();
+    if !config.enabled {
+        return (StatusCode::SERVICE_UNAVAILABLE, "OpenAI proxy is disabled").into_response();
+    }
+    if config.base_url.is_empty() || config.api_key.is_empty() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "OpenAI proxy is not configured",
+        )
+            .into_response();
+    }
+    if !config.protocol_mode.supports(&path) {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("{} protocol is not enabled", protocol_name(&path)),
+        )
+            .into_response();
+    }
+
+    let query = req.uri().query().map(ToOwned::to_owned);
+    let upstream_url = match build_upstream_url(&config.base_url, &path, query.as_deref()) {
         Ok(url) => url,
         Err(err) => return (StatusCode::BAD_GATEWAY, err).into_response(),
     };
 
-    info!("{} {} -> {}", req.method(), req.uri().path(), upstream_url);
-
     let authority = upstream_url.authority().to_string();
-
     let (parts, body) = req.into_parts();
-    let mut headers = filtered_headers(&parts.headers, HOP_BY_HOP_HEADERS);
-    if let Err(err) = set_host_header(&mut headers, &authority) {
-        return (StatusCode::BAD_GATEWAY, err).into_response();
-    }
+    let buffered_body = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Request body exceeds {MAX_REQUEST_BODY_BYTES} bytes"),
+            )
+                .into_response();
+        }
+    };
 
-    let mut builder = state.client.request(parts.method, upstream_url);
-    builder = builder.headers(headers);
-    builder = builder.body(reqwest::Body::wrap_stream(body.into_data_stream()));
+    let headers = match build_upstream_headers(&parts.headers, &authority, &config.api_key) {
+        Ok(headers) => headers,
+        Err(err) => return (StatusCode::BAD_GATEWAY, err).into_response(),
+    };
 
-    let upstream = match builder.send().await {
+    info!("{} {} -> {}", parts.method, path, upstream_url);
+
+    let upstream = match state
+        .client
+        .request(parts.method, upstream_url)
+        .headers(headers)
+        .body(buffered_body)
+        .send()
+        .await
+    {
         Ok(response) => response,
         Err(err) if err.is_timeout() => {
             return (StatusCode::GATEWAY_TIMEOUT, "Gateway Timeout").into_response();
         }
         Err(err) => {
-            error!("HTTP proxy error: {err}");
+            error!("OpenAI proxy error: {err}");
             return (StatusCode::BAD_GATEWAY, format!("Bad Gateway: {err}")).into_response();
         }
     };
@@ -335,142 +465,151 @@ async fn proxy_http_request(
         })
 }
 
-async fn proxy_websocket_request(
-    state: AppState,
-    req: Request,
-    route_match: RouteMatch,
-    query: Option<&str>,
-) -> Response<Body> {
-    let ws_url = match websocket_url(&route_match.target, &route_match.new_path, query) {
-        Ok(url) => url,
-        Err(err) => return (StatusCode::BAD_GATEWAY, err).into_response(),
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "me_api_proxy=info,tower_http=info".into()),
+        )
+        .init();
+
+    ensure_config_dir();
+    let db_path = get_db_path();
+    init_database(&db_path).expect("Failed to initialize SQLite database");
+
+    let admin = load_admin_credentials().expect("Failed to load admin credentials");
+    let config = load_config(&db_path).expect("Failed to load OpenAI config");
+    let state = AppState {
+        config: Arc::new(RwLock::new(config)),
+        client: build_client(),
+        db_path,
+        admin,
     };
 
-    let authority = ws_url.authority().to_string();
+    let admin_routes = Router::new()
+        .route("/admin", get(admin_page))
+        .route("/admin/api/config", get(get_config).put(update_config))
+        .layer(middleware::from_fn_with_state(state.clone(), admin_auth));
 
-    let protocols = extract_ws_protocols(req.headers());
-    let (mut parts, _) = req.into_parts();
-    let upgrade = match WebSocketUpgrade::from_request_parts(&mut parts, &state).await {
-        Ok(value) => value,
-        Err(err) => return (StatusCode::BAD_REQUEST, err.to_string()).into_response(),
-    };
+    let app = Router::new()
+        .merge(admin_routes)
+        .route(CHAT_PATH, put(proxy_openai).post(proxy_openai))
+        .route(RESPONSES_PATH, put(proxy_openai).post(proxy_openai))
+        .layer(TraceLayer::new_for_http())
+        .with_state(state);
 
-    let response_protocols = protocols.clone();
-    upgrade
-        .protocols(response_protocols)
-        .on_upgrade(move |socket| async move {
-            if let Err(err) = proxy_websocket(socket, ws_url, authority, parts.headers, protocols).await
-            {
-                error!("WebSocket proxy error: {err}");
-            }
-        })
+    let addr = "0.0.0.0:8080";
+    info!("Listening on {addr}");
+
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    axum::serve(listener, app).await.unwrap();
 }
 
-async fn proxy_websocket(
-    downstream: WebSocket,
-    ws_url: Url,
-    authority: String,
-    request_headers: HeaderMap,
-    protocols: Vec<String>,
-) -> Result<(), String> {
-    let mut client_request = ws_url
-        .as_str()
-        .into_client_request()
-        .map_err(|e| format!("Failed to build websocket request: {e}"))?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
 
-    {
-        let headers = client_request.headers_mut();
-        for (name, value) in filtered_headers(&request_headers, WS_HANDSHAKE_HEADERS).iter() {
-            headers.append(name.clone(), value.clone());
-        }
-        set_host_header(headers, &authority)?;
-        if !protocols.is_empty() {
-            let value = HeaderValue::from_str(&protocols.join(", "))
-                .map_err(|e| format!("Invalid Sec-WebSocket-Protocol header: {e}"))?;
-            headers.insert("Sec-WebSocket-Protocol", value);
-        }
+    #[test]
+    fn protocol_mode_supports_expected_paths() {
+        assert!(ProtocolMode::Chat.supports(CHAT_PATH));
+        assert!(!ProtocolMode::Chat.supports(RESPONSES_PATH));
+        assert!(ProtocolMode::Responses.supports(RESPONSES_PATH));
+        assert!(ProtocolMode::Both.supports(CHAT_PATH));
+        assert!(ProtocolMode::Both.supports(RESPONSES_PATH));
     }
 
-    let (upstream, _) = tokio_tungstenite::connect_async(client_request)
-        .await
-        .map_err(|e| format!("Upstream websocket connect failed: {e}"))?;
+    #[test]
+    fn validate_config_normalizes_base_url() {
+        let config = validate_config(OpenAiConfig {
+            base_url: " https://api.example.com/ ".to_string(),
+            api_key: " sk-test ".to_string(),
+            protocol_mode: ProtocolMode::Both,
+            enabled: true,
+        })
+        .unwrap();
 
-    let (mut downstream_sink, mut downstream_stream) = downstream.split();
-    let (mut upstream_sink, mut upstream_stream) = upstream.split();
+        assert_eq!(config.base_url, "https://api.example.com");
+        assert_eq!(config.api_key, "sk-test");
+    }
 
-    let client_to_upstream = async {
-        while let Some(message) = downstream_stream.next().await {
-            let message = message.map_err(|e| e.to_string())?;
-            match message {
-                Message::Text(text) => upstream_sink
-                    .send(WsMessage::Text(text.to_string().into()))
-                    .await
-                    .map_err(|e| e.to_string())?,
-                Message::Binary(data) => upstream_sink
-                    .send(WsMessage::Binary(data))
-                    .await
-                    .map_err(|e| e.to_string())?,
-                Message::Ping(data) => upstream_sink
-                    .send(WsMessage::Ping(data))
-                    .await
-                    .map_err(|e| e.to_string())?,
-                Message::Pong(data) => upstream_sink
-                    .send(WsMessage::Pong(data))
-                    .await
-                    .map_err(|e| e.to_string())?,
-                Message::Close(frame) => {
-                    let frame = frame.map(|frame| WsCloseFrame {
-                        code: WsCloseCode::from(u16::from(frame.code)),
-                        reason: frame.reason.to_string().into(),
-                    });
-                    upstream_sink
-                        .send(WsMessage::Close(frame))
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    break;
-                }
-            }
-        }
-        Ok::<(), String>(())
-    };
+    #[test]
+    fn validate_config_rejects_bad_values() {
+        assert!(validate_config(OpenAiConfig {
+            base_url: "".to_string(),
+            api_key: "sk".to_string(),
+            protocol_mode: ProtocolMode::Both,
+            enabled: true,
+        })
+        .is_err());
 
-    let upstream_to_client = async {
-        while let Some(message) = upstream_stream.next().await {
-            let message = message.map_err(|e| e.to_string())?;
-            match message {
-                WsMessage::Text(text) => downstream_sink
-                    .send(Message::Text(text.to_string().into()))
-                    .await
-                    .map_err(|e| e.to_string())?,
-                WsMessage::Binary(data) => downstream_sink
-                    .send(Message::Binary(data))
-                    .await
-                    .map_err(|e| e.to_string())?,
-                WsMessage::Ping(data) => downstream_sink
-                    .send(Message::Ping(data))
-                    .await
-                    .map_err(|e| e.to_string())?,
-                WsMessage::Pong(data) => downstream_sink
-                    .send(Message::Pong(data))
-                    .await
-                    .map_err(|e| e.to_string())?,
-                WsMessage::Close(frame) => {
-                    let frame = frame.map(|frame| CloseFrame {
-                        code: u16::from(frame.code).into(),
-                        reason: frame.reason.to_string().into(),
-                    });
-                    downstream_sink
-                        .send(Message::Close(frame))
-                        .await
-                        .map_err(|e| e.to_string())?;
-                    break;
-                }
-                WsMessage::Frame(_) => {}
-            }
-        }
-        Ok::<(), String>(())
-    };
+        assert!(validate_config(OpenAiConfig {
+            base_url: "ftp://example.com".to_string(),
+            api_key: "sk".to_string(),
+            protocol_mode: ProtocolMode::Both,
+            enabled: true,
+        })
+        .is_err());
 
-    let _ = tokio::join!(client_to_upstream, upstream_to_client);
-    Ok(())
+        assert!(validate_config(OpenAiConfig {
+            base_url: "https://example.com".to_string(),
+            api_key: "".to_string(),
+            protocol_mode: ProtocolMode::Both,
+            enabled: true,
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn build_upstream_url_preserves_base_path_and_query() {
+        let url = build_upstream_url(
+            "https://gateway.example.com/openai",
+            CHAT_PATH,
+            Some("stream=true"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "https://gateway.example.com/openai/v1/chat/completions?stream=true"
+        );
+    }
+
+    #[test]
+    fn build_upstream_headers_replaces_authorization() {
+        let mut source = HeaderMap::new();
+        source.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer client-key"),
+        );
+        source.insert(header::HOST, HeaderValue::from_static("proxy.local"));
+        source.insert("x-request-id", HeaderValue::from_static("req-1"));
+
+        let headers = build_upstream_headers(&source, "api.example.com", "upstream-key").unwrap();
+
+        assert_eq!(
+            headers.get(header::AUTHORIZATION).unwrap(),
+            "Bearer upstream-key"
+        );
+        assert_eq!(headers.get(header::HOST).unwrap(), "api.example.com");
+        assert_eq!(headers.get("x-request-id").unwrap(), "req-1");
+    }
+
+    #[test]
+    fn init_database_creates_default_openai_config() {
+        let path = std::env::temp_dir().join(format!(
+            "me-api-proxy-openai-test-{}.db",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+
+        init_database(&path).unwrap();
+        let config = load_config(&path).unwrap();
+
+        assert_eq!(config, OpenAiConfig::default());
+        let _ = fs::remove_file(path);
+    }
 }

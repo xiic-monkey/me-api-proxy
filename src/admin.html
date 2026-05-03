@@ -1,0 +1,359 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OpenAI 代理配置</title>
+  <style>
+    :root {
+      --bg: #f5f6f8;
+      --panel: #ffffff;
+      --text: #111827;
+      --muted: #6b7280;
+      --accent: #2563eb;
+      --accent-strong: #1d4ed8;
+      --danger: #dc2626;
+      --border: #e5e7eb;
+      --soft: #f9fafb;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: "PingFang SC", "Noto Sans SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+      color: var(--text);
+      background: var(--bg);
+    }
+
+    .shell {
+      max-width: 880px;
+      margin: 0 auto;
+      padding: 20px 16px 28px;
+    }
+
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      gap: 16px;
+      margin-bottom: 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 22px;
+      line-height: 1.2;
+      font-weight: 700;
+    }
+
+    .hint {
+      margin: 4px 0 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 4px 8px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .status-pill.enabled {
+      color: var(--accent-strong);
+      background: #eff6ff;
+    }
+
+    .status-pill.disabled {
+      color: var(--danger);
+      background: #fef2f2;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+    }
+
+    .panel-body {
+      padding: 16px;
+    }
+
+    form {
+      display: grid;
+      gap: 12px;
+    }
+
+    label {
+      display: grid;
+      gap: 5px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    input[type="url"],
+    input[type="text"],
+    select {
+      width: 100%;
+      padding: 9px 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+      line-height: 1.5;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 220px;
+      gap: 12px;
+      align-items: start;
+    }
+
+    .checkbox {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    input[type="checkbox"] {
+      width: 18px;
+      height: 18px;
+      accent-color: var(--accent);
+    }
+
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding-top: 2px;
+    }
+
+    button {
+      border: 0;
+      border-radius: 8px;
+      padding: 8px 14px;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      background: var(--accent);
+      color: #fff;
+    }
+
+    button:disabled {
+      opacity: 0.65;
+      cursor: wait;
+    }
+
+    .message {
+      min-height: 20px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .message.success {
+      color: var(--accent-strong);
+    }
+
+    .message.error {
+      color: var(--danger);
+    }
+
+    .endpoints {
+      margin-top: 14px;
+      display: grid;
+      gap: 8px;
+    }
+
+    .endpoint {
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--soft);
+      font-size: 12px;
+      color: var(--muted);
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    code {
+      color: var(--text);
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+    }
+
+    @media (max-width: 720px) {
+      .header,
+      .endpoint {
+        display: grid;
+        align-items: start;
+      }
+
+      .grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="header">
+      <div>
+        <h1>OpenAI 代理配置</h1>
+        <p class="hint">只需配置 Base URL 和 API Key。代理会对外提供标准 OpenAI 接口，并自动替换上游鉴权。</p>
+      </div>
+      <span id="state-pill" class="status-pill disabled">未启用</span>
+    </header>
+
+    <section class="panel">
+      <div class="panel-body">
+        <form id="config-form">
+          <label>
+            Base URL
+            <input id="base_url" type="url" placeholder="https://api.openai.com" required />
+          </label>
+
+          <label>
+            API Key
+            <input id="api_key" type="text" placeholder="sk-..." required />
+          </label>
+
+          <div class="grid">
+            <label>
+              协议支持
+              <select id="protocol_mode">
+                <option value="both">Chat + Responses</option>
+                <option value="chat">仅 Chat Completions</option>
+                <option value="responses">仅 Responses</option>
+              </select>
+            </label>
+
+            <label class="checkbox">
+              <input id="enabled" type="checkbox" />
+              启用代理
+            </label>
+          </div>
+
+          <div class="actions">
+            <button id="save-btn" type="submit">保存配置</button>
+            <span id="message" class="message"></span>
+          </div>
+        </form>
+      </div>
+    </section>
+
+    <section class="endpoints">
+      <div class="endpoint">
+        <span>Chat Completions</span>
+        <code>POST /v1/chat/completions</code>
+      </div>
+      <div class="endpoint">
+        <span>Responses</span>
+        <code>POST /v1/responses</code>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const form = document.getElementById("config-form");
+    const baseUrlInput = document.getElementById("base_url");
+    const apiKeyInput = document.getElementById("api_key");
+    const protocolModeInput = document.getElementById("protocol_mode");
+    const enabledInput = document.getElementById("enabled");
+    const saveBtn = document.getElementById("save-btn");
+    const messageEl = document.getElementById("message");
+    const statePill = document.getElementById("state-pill");
+
+    function setMessage(text, type = "") {
+      messageEl.textContent = text || "";
+      messageEl.className = type ? `message ${type}` : "message";
+    }
+
+    function setBusy(busy) {
+      saveBtn.disabled = busy;
+      saveBtn.textContent = busy ? "保存中..." : "保存配置";
+    }
+
+    function renderState(enabled) {
+      statePill.textContent = enabled ? "已启用" : "未启用";
+      statePill.className = `status-pill ${enabled ? "enabled" : "disabled"}`;
+    }
+
+    async function request(url, options = {}) {
+      const response = await fetch(url, {
+        headers: {
+          "Content-Type": "application/json",
+          ...(options.headers || {}),
+        },
+        ...options,
+      });
+
+      const text = await response.text();
+      const data = text ? JSON.parse(text) : null;
+
+      if (!response.ok) {
+        throw new Error((data && data.error) || `请求失败：${response.status}`);
+      }
+
+      return data;
+    }
+
+    function fillForm(config) {
+      baseUrlInput.value = config.base_url || "";
+      apiKeyInput.value = config.api_key || "";
+      protocolModeInput.value = config.protocol_mode || "both";
+      enabledInput.checked = Boolean(config.enabled);
+      renderState(Boolean(config.enabled));
+    }
+
+    async function loadConfig() {
+      const config = await request("/admin/api/config");
+      fillForm(config);
+    }
+
+    form.addEventListener("submit", async (event) => {
+      event.preventDefault();
+      setBusy(true);
+      setMessage("正在保存...");
+
+      try {
+        await request("/admin/api/config", {
+          method: "PUT",
+          body: JSON.stringify({
+            base_url: baseUrlInput.value,
+            api_key: apiKeyInput.value,
+            protocol_mode: protocolModeInput.value,
+            enabled: enabledInput.checked,
+          }),
+        });
+        renderState(enabledInput.checked);
+        setMessage("已保存。", "success");
+      } catch (error) {
+        setMessage(error.message, "error");
+      } finally {
+        setBusy(false);
+      }
+    });
+
+    loadConfig().catch((error) => {
+      setMessage(error.message, "error");
+    });
+  </script>
+</body>
+</html>
