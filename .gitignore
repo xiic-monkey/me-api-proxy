@@ -4,6 +4,10 @@
 # Local environment and editor files
 .env
 .env.*
+!.env.example
 .idea/
 .vscode/
 .DS_Store
+.me-api-proxy/
+.rustup/
+data/

@@ -1,13 +1,17 @@
-version: '3.8'
-
 services:
   me-api-proxy:
-    image: xiicu/me-api-proxy:latest
+    image: ${IMAGE_NAME:-ghcr.io/xiic-monkey/me-api-proxy:latest}
+    container_name: ${CONTAINER_NAME:-me-api-proxy}
     ports:
-      - "38001:8080"
+      - "${HOST_PORT:-38001}:8080"
+    environment:
+      ADMIN_USERNAME: ${ADMIN_USERNAME:?set ADMIN_USERNAME}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD}
+      RUST_LOG: ${RUST_LOG:-me_api_proxy=info,tower_http=info}
     volumes:
-      - ~/.me-api-proxy:/root/.me-api-proxy
+      - ${CONFIG_DIR:-./data}:/home/app/.me-api-proxy
     restart: unless-stopped
+    pull_policy: always
     logging:
       driver: "json-file"
       options:

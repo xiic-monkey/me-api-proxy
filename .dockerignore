@@ -2,3 +2,8 @@ target/
 .git/
 *.log
 .docker/
+.me-api-proxy/
+.rustup/
+.github/
+.idea/
+data/

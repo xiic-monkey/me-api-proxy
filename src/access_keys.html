@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>接入 Key 管理</title>
+  <style>
+    :root {
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --line: #e6eaf0;
+      --text: #101828;
+      --muted: #667085;
+      --blue: #2563eb;
+      --green: #047857;
+      --green-soft: #ecfdf3;
+      --red: #b42318;
+      --red-soft: #fef3f2;
+      --shadow: 0 8px 24px rgba(16, 24, 40, 0.06);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: linear-gradient(180deg, #f8fafc 0%, #f4f6f8 100%);
+      color: var(--text);
+      font: 14px/1.45 "PingFang SC", "SF Pro Display", "Microsoft YaHei", sans-serif;
+    }
+
+    .app {
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 24px;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 16px;
+    }
+
+    h1,
+    h2 {
+      margin: 0;
+      line-height: 1.2;
+    }
+
+    h1 {
+      font-size: 22px;
+      letter-spacing: -0.02em;
+    }
+
+    .sub {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 18px 20px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .panel-body {
+      padding: 18px 20px 20px;
+    }
+
+    .toolbar {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      min-height: 36px;
+      padding: 0 14px;
+      border: 0;
+      border-radius: 10px;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      transition: 0.16s ease;
+    }
+
+    .button.primary {
+      background: var(--blue);
+      color: #fff;
+    }
+
+    .button.primary:hover {
+      background: #1d4ed8;
+    }
+
+    .button.light {
+      background: #f8fafc;
+      color: #344054;
+      border: 1px solid var(--line);
+    }
+
+    .button.light:hover {
+      background: #eef2f6;
+    }
+
+    .button.danger {
+      background: var(--red-soft);
+      color: var(--red);
+    }
+
+    .button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    .summary {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 16px;
+    }
+
+    .chip {
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.84);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .status {
+      margin-bottom: 12px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .status.error {
+      color: var(--red);
+    }
+
+    .key-list {
+      display: grid;
+      gap: 12px;
+    }
+
+    .key-card {
+      display: grid;
+      gap: 12px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #fcfcfd;
+    }
+
+    .key-grid {
+      display: grid;
+      grid-template-columns: 220px minmax(0, 1fr) 220px;
+      gap: 12px;
+      align-items: end;
+    }
+
+    .field {
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .field label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    input,
+    select {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+      outline: none;
+      transition: border-color 0.16s ease, box-shadow 0.16s ease;
+    }
+
+    input:focus,
+    select:focus {
+      border-color: #9ec5ff;
+      box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.08);
+    }
+
+    .key-value {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+    }
+
+    .meta {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .empty {
+      padding: 22px 16px;
+      border: 1px dashed var(--line);
+      border-radius: 14px;
+      background: #fafbfc;
+      color: var(--muted);
+      text-align: center;
+      font-size: 13px;
+    }
+
+    @media (max-width: 920px) {
+      .topbar,
+      .panel-head,
+      .meta {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .key-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="topbar">
+      <div>
+        <h1>接入 Key 管理</h1>
+        <div class="sub">外部客户端使用 `me-...` 调用代理，并按 Key 绑定到指定代理。</div>
+      </div>
+      <div class="toolbar">
+        <a class="button light" href="/admin">返回代理</a>
+        <button class="button primary" id="createAccessKeyBtn">+ 新增 Key</button>
+      </div>
+    </div>
+
+    <div class="summary" id="summary"></div>
+
+    <section class="panel">
+      <div class="panel-head">
+        <h2>接入 Key 列表</h2>
+      </div>
+      <div class="panel-body">
+        <div class="status" id="statusText">加载中...</div>
+        <div class="key-list" id="keyList"></div>
+      </div>
+    </section>
+  </div>
+
+  <script>
+    const state = {
+      items: [],
+      proxies: [],
+      loadState: 'idle',
+      statusText: '',
+      nextLocalId: 1
+    };
+
+    const summary = document.getElementById('summary');
+    const keyList = document.getElementById('keyList');
+    const statusText = document.getElementById('statusText');
+
+    function nextLocalId() {
+      const id = `access-key-${state.nextLocalId}`;
+      state.nextLocalId += 1;
+      return id;
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+    }
+
+    function escapeAttr(value) {
+      return escapeHtml(value).replaceAll("'", '&#39;');
+    }
+
+    function apiRequest(path, options = {}) {
+      const { method = 'GET', body } = options;
+      const url = new URL(path, `${window.location.protocol}//${window.location.host}`);
+      return fetch(url, {
+        method,
+        headers: body ? { 'Content-Type': 'application/json' } : {},
+        body: body ? JSON.stringify(body) : undefined,
+        credentials: 'same-origin'
+      }).then(async response => {
+        const contentType = response.headers.get('content-type') || '';
+        let payload = null;
+        if (contentType.includes('application/json')) {
+          payload = await response.json();
+        } else {
+          const text = await response.text();
+          payload = text ? { error: text } : null;
+        }
+
+        if (!response.ok) {
+          throw new Error(
+            payload?.error ||
+            (response.status === 401 ? '认证失效，请刷新页面重新登录' : `${response.status} ${response.statusText}`)
+          );
+        }
+
+        return payload;
+      });
+    }
+
+    function formatTime(timestamp) {
+      if (!timestamp) return '-';
+      try {
+        return new Date(timestamp * 1000).toLocaleString('zh-CN', { hour12: false });
+      } catch (_) {
+        return '-';
+      }
+    }
+
+    function mapAccessKey(item) {
+      return {
+        localId: `saved-${item.id}`,
+        id: item.id,
+        name: item.name,
+        accessKey: item.access_key,
+        proxyId: item.proxy_id,
+        proxyName: item.proxy_name,
+        createdAt: item.created_at,
+        updatedAt: item.updated_at,
+        saving: false,
+        error: ''
+      };
+    }
+
+    function currentProxyName(proxyId) {
+      return state.proxies.find(proxy => proxy.id === Number(proxyId))?.name || '';
+    }
+
+    async function loadAccessKeys() {
+      state.loadState = 'loading';
+      state.statusText = '加载中...';
+      render();
+
+      try {
+        const data = await apiRequest('/admin/api/access-keys');
+        state.proxies = data.proxies || [];
+        state.items = (data.access_keys || []).map(mapAccessKey);
+        state.loadState = 'ready';
+        state.statusText = '';
+      } catch (error) {
+        state.loadState = 'error';
+        state.statusText = error.message || '加载失败';
+      }
+
+      render();
+    }
+
+    function createDraft() {
+      const defaultProxy = state.proxies[0]?.id || '';
+      state.items.unshift({
+        localId: nextLocalId(),
+        id: null,
+        name: `接入 Key ${state.items.filter(item => !item.id).length + 1}`,
+        accessKey: '',
+        proxyId: defaultProxy,
+        proxyName: currentProxyName(defaultProxy),
+        createdAt: null,
+        updatedAt: null,
+        saving: false,
+        error: ''
+      });
+      render();
+    }
+
+    function validateItem(item) {
+      if (!item.name.trim()) {
+        return '名称不能为空';
+      }
+      if (!item.proxyId) {
+        return '请选择代理';
+      }
+      if (!state.proxies.some(proxy => proxy.id === Number(item.proxyId))) {
+        return '绑定代理不存在';
+      }
+      return '';
+    }
+
+    async function saveItem(localId) {
+      const item = state.items.find(entry => entry.localId === localId);
+      if (!item) return;
+
+      const validationError = validateItem(item);
+      if (validationError) {
+        item.error = validationError;
+        render();
+        return;
+      }
+
+      item.saving = true;
+      item.error = '';
+      render();
+
+      try {
+        const payload = {
+          name: item.name.trim(),
+          proxy_id: Number(item.proxyId)
+        };
+
+        if (item.id) {
+          await apiRequest(`/admin/api/access-keys/${item.id}`, { method: 'PUT', body: payload });
+        } else {
+          await apiRequest('/admin/api/access-keys', { method: 'POST', body: payload });
+        }
+
+        await loadAccessKeys();
+      } catch (error) {
+        item.saving = false;
+        item.error = error.message || '保存失败';
+        render();
+      }
+    }
+
+    async function deleteItem(localId) {
+      const item = state.items.find(entry => entry.localId === localId);
+      if (!item) return;
+
+      if (!item.id) {
+        state.items = state.items.filter(entry => entry.localId !== localId);
+        render();
+        return;
+      }
+
+      item.saving = true;
+      item.error = '';
+      render();
+
+      try {
+        await apiRequest(`/admin/api/access-keys/${item.id}`, { method: 'DELETE' });
+        await loadAccessKeys();
+      } catch (error) {
+        item.saving = false;
+        item.error = error.message || '删除失败';
+        render();
+      }
+    }
+
+    async function copyKey(value) {
+      try {
+        await navigator.clipboard.writeText(value);
+        state.statusText = '已复制接入 Key';
+        render();
+      } catch (_) {
+        state.statusText = '复制失败，请手动复制';
+        render();
+      }
+    }
+
+    function renderSummary() {
+      const boundProxyIds = new Set(state.items.filter(item => item.proxyId).map(item => Number(item.proxyId)));
+      summary.innerHTML = `
+        <div class="chip">接入 Key ${state.items.length} 个</div>
+        <div class="chip">已接入代理 ${boundProxyIds.size} 个</div>
+        <div class="chip">可绑定代理 ${state.proxies.length} 个</div>
+      `;
+    }
+
+    function renderList() {
+      statusText.textContent = state.statusText || (state.loadState === 'ready' ? '' : '加载中...');
+      statusText.className = `status${state.loadState === 'error' ? ' error' : ''}`;
+
+      if (state.loadState === 'loading' && !state.items.length) {
+        keyList.innerHTML = '<div class="empty">加载中...</div>';
+        return;
+      }
+
+      if (!state.items.length) {
+        keyList.innerHTML = '<div class="empty">还没有接入 Key，先新建一个。</div>';
+        return;
+      }
+
+      keyList.innerHTML = state.items.map(item => `
+        <article class="key-card">
+          <div class="key-grid">
+            <div class="field">
+              <label>名称</label>
+              <input value="${escapeAttr(item.name)}" data-input="name" data-local-id="${item.localId}" />
+            </div>
+            <div class="field">
+              <label>接入 Key</label>
+              <input class="key-value" readonly value="${escapeAttr(item.accessKey || '保存后自动生成 me-Key')}" />
+            </div>
+            <div class="field">
+              <label>绑定代理</label>
+              <select data-input="proxy" data-local-id="${item.localId}">
+                <option value="">请选择代理</option>
+                ${state.proxies.map(proxy => `
+                  <option value="${proxy.id}" ${Number(item.proxyId) === proxy.id ? 'selected' : ''}>${escapeHtml(proxy.name)}</option>
+                `).join('')}
+              </select>
+            </div>
+          </div>
+          <div class="meta">
+            <div>
+              <div>当前代理：${escapeHtml(item.proxyName || currentProxyName(item.proxyId) || '-')}</div>
+              <div>创建于：${escapeHtml(formatTime(item.createdAt))}　更新于：${escapeHtml(formatTime(item.updatedAt))}</div>
+              ${item.error ? `<div style="color:var(--red); margin-top:4px;">${escapeHtml(item.error)}</div>` : ''}
+            </div>
+            <div class="actions">
+              ${item.accessKey ? `<button class="button light" data-action="copy" data-local-id="${item.localId}">复制</button>` : ''}
+              <button class="button primary" data-action="save" data-local-id="${item.localId}" ${item.saving ? 'disabled' : ''}>${item.saving ? '保存中' : '保存'}</button>
+              <button class="button danger" data-action="delete" data-local-id="${item.localId}" ${item.saving ? 'disabled' : ''}>删除</button>
+            </div>
+          </div>
+        </article>
+      `).join('');
+    }
+
+    function render() {
+      renderSummary();
+      renderList();
+    }
+
+    document.getElementById('createAccessKeyBtn').addEventListener('click', createDraft);
+
+    document.addEventListener('input', event => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      const localId = target.dataset?.localId;
+      const inputType = target.dataset?.input;
+      if (!localId || !inputType) return;
+
+      const item = state.items.find(entry => entry.localId === localId);
+      if (!item) return;
+
+      if (inputType === 'name') {
+        item.name = target.value;
+      }
+    });
+
+    document.addEventListener('change', event => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      const localId = target.dataset?.localId;
+      if (!localId || target.dataset?.input !== 'proxy') return;
+
+      const item = state.items.find(entry => entry.localId === localId);
+      if (!item) return;
+      item.proxyId = target.value;
+      item.proxyName = currentProxyName(target.value);
+      render();
+    });
+
+    document.addEventListener('click', event => {
+      const button = event.target.closest('[data-action]');
+      if (!button) return;
+
+      const localId = button.dataset.localId;
+      if (!localId) return;
+
+      if (button.dataset.action === 'save') {
+        saveItem(localId);
+        return;
+      }
+
+      if (button.dataset.action === 'delete') {
+        deleteItem(localId);
+        return;
+      }
+
+      if (button.dataset.action === 'copy') {
+        const item = state.items.find(entry => entry.localId === localId);
+        if (item?.accessKey) {
+          copyKey(item.accessKey);
+        }
+      }
+    });
+
+    loadAccessKeys();
+  </script>
+</body>
+</html>
