@@ -273,6 +273,33 @@
       margin-left: auto;
     }
 
+    .icon-ghost {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      border: 0;
+      padding: 0;
+      border-radius: 8px;
+      background: transparent;
+      color: #98a2b3;
+      cursor: pointer;
+      transition: color 0.16s ease, background 0.16s ease;
+      flex: 0 0 auto;
+    }
+
+    .icon-ghost:hover {
+      color: var(--red);
+      background: rgba(180, 35, 24, 0.08);
+    }
+
+    .icon-ghost svg {
+      width: 16px;
+      height: 16px;
+      display: block;
+    }
+
     .editor-placeholder,
     .editor-view {
       min-height: 720px;
@@ -704,6 +731,45 @@
       return findDraftBase(baseLocalId)?.keys.find(item => item.localId === keyLocalId) || null;
     }
 
+    function collectUsedLocalIds() {
+      const used = new Set();
+
+      for (const pool of state.pools) {
+        if (!pool) continue;
+        used.add(pool.localId);
+        for (const base of pool.baseUrls || []) {
+          used.add(base.localId);
+          for (const key of base.keys || []) {
+            used.add(key.localId);
+          }
+        }
+      }
+
+      const draftPool = currentEditablePool();
+      if (draftPool) {
+        used.add(draftPool.localId);
+        for (const base of draftPool.baseUrls || []) {
+          used.add(base.localId);
+          for (const key of base.keys || []) {
+            used.add(key.localId);
+          }
+        }
+      }
+
+      return used;
+    }
+
+    function ensureNextLocalIdAvailable() {
+      const used = collectUsedLocalIds();
+      while (
+        used.has(`proxy-${state.nextLocalId}`) ||
+        used.has(`supplier-${state.nextLocalId}`) ||
+        used.has(`key-${state.nextLocalId}`)
+      ) {
+        state.nextLocalId += 1;
+      }
+    }
+
     function syncDraftFromSelected() {
       const pool = currentPool();
       state.draftPool = pool ? deepClone(pool) : null;
@@ -901,6 +967,7 @@
     }
 
     function createPool() {
+      ensureNextLocalIdAvailable();
       const localId = nextLocalId('proxy');
       const pool = {
         localId,
@@ -923,6 +990,7 @@
       const pool = currentEditablePool();
       if (!pool || pool.localId !== poolLocalId) return;
 
+      ensureNextLocalIdAvailable();
       const base = {
         localId: nextLocalId('supplier'),
         id: null,
@@ -943,6 +1011,7 @@
       const base = findDraftBase(baseLocalId);
       if (!base) return;
 
+      ensureNextLocalIdAvailable();
       base.keys.push({
         localId: nextLocalId('key'),
         id: null,
@@ -1091,6 +1160,45 @@
       }
     }
 
+    async function deletePool(poolLocalId) {
+      const pool = state.pools.find(item => item.localId === poolLocalId) || currentEditablePool();
+      if (!pool?.id) {
+        return;
+      }
+
+      if (hasUnsavedChanges()) {
+        state.saveState = 'error';
+        state.errorMessage = '请先保存或放弃当前改动';
+        render();
+        return;
+      }
+
+      const confirmed = window.confirm(`确认删除代理“${pool.name}”吗？已绑定的接入 Key 也会一并解除。`);
+      if (!confirmed) {
+        return;
+      }
+
+      state.saveState = 'saving';
+      state.errorMessage = '正在删除代理...';
+      render();
+
+      try {
+        await apiRequest(`/admin/api/proxies/${pool.id}`, { method: 'DELETE' });
+        if (state.selectedPoolLocalId === pool.localId && state.mode === 'edit') {
+          state.mode = 'empty';
+          state.selectedPoolLocalId = null;
+          state.draftPool = null;
+        }
+        state.saveState = 'saved';
+        state.errorMessage = '代理已删除';
+        await loadProxies();
+      } catch (error) {
+        state.saveState = 'error';
+        state.errorMessage = error.message || '删除失败';
+        render();
+      }
+    }
+
     async function runKeyAction(action, keyId) {
       if (hasUnsavedChanges()) {
         state.saveState = 'error';
@@ -1161,7 +1269,16 @@
               <div style="min-width:0;">
                 <div class="pool-name">${escapeHtml(pool.name)}</div>
               </div>
-              <span class="tag ${pool.inUse ? 'active' : 'idle'}">${pool.inUse ? '使用中' : '未接入'}</span>
+              <div class="pool-actions">
+                <span class="tag ${pool.inUse ? 'active' : 'idle'}">${pool.inUse ? '使用中' : '未接入'}</span>
+                ${pool.id ? `
+                  <button class="icon-ghost" data-action="delete-pool" data-local-id="${pool.localId}" title="删除代理" aria-label="删除代理">
+                    <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                      <path d="M4.167 5h11.666M7.5 5V3.833c0-.46.373-.833.833-.833h3.334c.46 0 .833.373.833.833V5m-6.667 0v9.167c0 .92.746 1.666 1.667 1.666h5c.92 0 1.667-.746 1.667-1.666V5M8.333 8.333v4.167M11.667 8.333v4.167" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                  </button>
+                ` : ''}
+              </div>
             </div>
 
             <div class="pool-foot">
@@ -1199,7 +1316,9 @@
       const totalKeys = pool.baseUrls.reduce((sum, item) => sum + item.keys.length, 0);
 
       editorTitle.textContent = `${pool.name} · 编辑`;
-      editorSub.textContent = '编辑代理基本信息，并在下方维护供应商与 API Key。';
+      editorSub.textContent = pool.id
+        ? '编辑代理基本信息，并在下方维护供应商与 API Key。删除后会同步清理已绑定的接入 Key。'
+        : '编辑代理基本信息，并在下方维护供应商与 API Key。未保存的新代理可直接返回放弃。';
       backToEmpty.style.display = 'inline';
 
       editorRoot.innerHTML = `
@@ -1218,7 +1337,10 @@
                 <span class="summary-chip">Key ${totalKeys} 个</span>
               </div>
             </div>
-            <button class="button primary" data-action="save-pool">保存</button>
+            <div class="inline">
+              ${pool.id ? '<button class="button danger" data-action="delete-pool" data-local-id="' + pool.localId + '">删除代理</button>' : ''}
+              <button class="button primary" data-action="save-pool">保存</button>
+            </div>
           </div>
 
           <div class="editor-sections">
@@ -1261,6 +1383,7 @@
           </div>
 
           <div class="editor-footer">
+            ${pool.id ? '<button class="button danger" data-action="delete-pool" data-local-id="' + pool.localId + '">删除代理</button>' : ''}
             <button class="button primary" data-action="save-pool">保存</button>
           </div>
         </div>
@@ -1460,6 +1583,12 @@
 
       if (action === 'save-pool') {
         saveCurrentPool();
+        return;
+      }
+
+      if (action === 'delete-pool') {
+        event.stopPropagation();
+        deletePool(localId || state.selectedPoolLocalId);
         return;
       }
 
