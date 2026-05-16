@@ -1,0 +1,1626 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>代理管理</title>
+  <style>
+    :root {
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --line: #e6eaf0;
+      --text: #101828;
+      --muted: #667085;
+      --blue: #2563eb;
+      --blue-soft: #eff6ff;
+      --green: #047857;
+      --green-soft: #ecfdf3;
+      --red: #b42318;
+      --red-soft: #fef3f2;
+      --shadow: 0 8px 24px rgba(16, 24, 40, 0.06);
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      height: 100vh;
+      overflow: hidden;
+      background: linear-gradient(180deg, #f8fafc 0%, #f4f6f8 100%);
+      color: var(--text);
+      font: 14px/1.45 "PingFang SC", "SF Pro Display", "Microsoft YaHei", sans-serif;
+    }
+
+    .app {
+      max-width: 1380px;
+      margin: 0 auto;
+      padding: 24px;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .shell {
+      display: grid;
+      grid-template-columns: 420px minmax(0, 1fr);
+      gap: 20px;
+      align-items: stretch;
+      flex: 1 1 auto;
+      min-height: 0;
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+    }
+
+    .panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 18px 20px;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.9);
+      backdrop-filter: blur(10px);
+    }
+
+    .panel-body {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: auto;
+      padding: 18px 20px 20px;
+    }
+
+    h1,
+    h2,
+    h3,
+    h4 {
+      margin: 0;
+      line-height: 1.2;
+    }
+
+    h1 {
+      font-size: 22px;
+      letter-spacing: -0.02em;
+    }
+
+    h2 {
+      font-size: 16px;
+    }
+
+    h3 {
+      font-size: 15px;
+    }
+
+    h4 {
+      font-size: 13px;
+    }
+
+    .sub {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 16px;
+      flex: 0 0 auto;
+    }
+
+    .topbar-stats {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .stat {
+      padding: 8px 12px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.84);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 6px;
+      min-height: 36px;
+      padding: 0 14px;
+      border: 0;
+      border-radius: 10px;
+      font: inherit;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      transition: 0.16s ease;
+    }
+
+    .button.primary {
+      background: var(--blue);
+      color: #fff;
+    }
+
+    .button.primary:hover {
+      background: #1d4ed8;
+    }
+
+    .button.light {
+      background: #f8fafc;
+      color: #344054;
+      border: 1px solid var(--line);
+    }
+
+    .button.light:hover {
+      background: #eef2f6;
+    }
+
+    .button.success {
+      background: var(--green-soft);
+      color: var(--green);
+    }
+
+    .button.danger {
+      background: var(--red-soft);
+      color: var(--red);
+    }
+
+    .button.icon {
+      width: 36px;
+      padding: 0;
+    }
+
+    .button:disabled {
+      opacity: 0.55;
+      cursor: not-allowed;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      height: 24px;
+      padding: 0 9px;
+      border-radius: 999px;
+      font-size: 12px;
+      font-weight: 600;
+      white-space: nowrap;
+    }
+
+    .tag.active {
+      color: var(--green);
+      background: var(--green-soft);
+    }
+
+    .tag.idle {
+      color: var(--muted);
+      background: #f2f4f7;
+    }
+
+    .pool-list {
+      display: grid;
+      gap: 12px;
+    }
+
+    .pool-card {
+      display: grid;
+      gap: 14px;
+      padding: 16px;
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #fff;
+      transition: 0.18s ease;
+      cursor: pointer;
+    }
+
+    .pool-card.selected {
+      border-color: #b8d4ff;
+      background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
+      box-shadow: 0 10px 28px rgba(37, 99, 235, 0.08);
+    }
+
+    .pool-head,
+    .pool-foot,
+    .inline,
+    .field-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+    }
+
+    .pool-head {
+      align-items: flex-start;
+    }
+
+    .pool-name {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+    }
+
+    .pool-meta {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .pool-desc {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .pool-actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-left: auto;
+    }
+
+    .icon-ghost {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      border: 0;
+      padding: 0;
+      border-radius: 8px;
+      background: transparent;
+      color: #98a2b3;
+      cursor: pointer;
+      transition: color 0.16s ease, background 0.16s ease;
+      flex: 0 0 auto;
+    }
+
+    .icon-ghost:hover {
+      color: var(--red);
+      background: rgba(180, 35, 24, 0.08);
+    }
+
+    .icon-ghost svg {
+      width: 16px;
+      height: 16px;
+      display: block;
+    }
+
+    .editor-placeholder,
+    .editor-view {
+      min-height: 720px;
+    }
+
+    .editor-placeholder {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--muted);
+      text-align: center;
+      padding: 48px 24px;
+    }
+
+    .editor-view {
+      display: grid;
+      gap: 16px;
+    }
+
+    .editor-toolbar,
+    .summary-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .summary-bar {
+      padding: 14px 16px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fbfcfe;
+    }
+
+    .summary-items {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .summary-chip {
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: #fff;
+      border: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .error-text {
+      color: var(--red);
+      font-size: 12px;
+    }
+
+    .status-chip {
+      display: inline-flex;
+      align-items: center;
+      height: 28px;
+      padding: 0 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .status-chip.dirty {
+      color: #b45309;
+      background: #fff7ed;
+      border-color: #fed7aa;
+    }
+
+    .status-chip.saving {
+      color: #1d4ed8;
+      background: #eff6ff;
+      border-color: #bfdbfe;
+    }
+
+    .status-chip.saved {
+      color: var(--green);
+      background: var(--green-soft);
+      border-color: #bbf7d0;
+    }
+
+    .status-chip.error {
+      color: var(--red);
+      background: var(--red-soft);
+      border-color: #fecaca;
+    }
+
+    .editor-sections {
+      display: grid;
+      gap: 14px;
+    }
+
+    .editor-footer {
+      display: flex;
+      justify-content: flex-end;
+      padding-top: 4px;
+    }
+
+    .section {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: #fff;
+      overflow: hidden;
+    }
+
+    .section-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 16px;
+      border-bottom: 1px solid var(--line);
+      background: #fcfcfd;
+    }
+
+    .section-body {
+      padding: 16px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .field-grid {
+      display: grid;
+      grid-template-columns: 1fr 220px;
+      gap: 12px;
+    }
+
+    .field-grid.single {
+      grid-template-columns: 1fr;
+    }
+
+    .field {
+      display: grid;
+      gap: 6px;
+    }
+
+    .field label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    input,
+    select,
+    textarea {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+      outline: none;
+      transition: border-color 0.16s ease, box-shadow 0.16s ease;
+    }
+
+    input:focus,
+    select:focus,
+    textarea:focus {
+      border-color: #9ec5ff;
+      box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.08);
+    }
+
+    .base-list,
+    .key-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .base-card {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fcfcfd;
+      overflow: hidden;
+    }
+
+    .base-card-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 14px 14px 12px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .base-title {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .base-title h4 {
+      margin: 0;
+    }
+
+    .base-title-input {
+      width: 220px;
+      min-height: 34px;
+      padding: 6px 10px;
+      border-radius: 10px;
+    }
+
+    .base-card-body {
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+    }
+
+    .key-row {
+      display: grid;
+      gap: 10px;
+      padding: 10px 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+    }
+
+    .key-info {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+
+    .key-input {
+      width: 100%;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px;
+    }
+
+    .key-state {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .key-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    .key-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+
+    .empty {
+      padding: 22px 16px;
+      border: 1px dashed var(--line);
+      border-radius: 14px;
+      background: #fafbfc;
+      color: var(--muted);
+      text-align: center;
+      font-size: 13px;
+    }
+
+    .back-link {
+      color: var(--blue);
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .back-link:hover {
+      text-decoration: underline;
+    }
+
+    @media (max-width: 1180px) {
+      body {
+        height: auto;
+        overflow: auto;
+      }
+
+      .app {
+        height: auto;
+        overflow: visible;
+      }
+
+      .shell {
+        grid-template-columns: 1fr;
+        flex: none;
+      }
+
+      .editor-placeholder,
+      .editor-view {
+        min-height: 0;
+      }
+
+      .panel {
+        min-height: auto;
+      }
+
+      .panel-body {
+        overflow: visible;
+      }
+    }
+
+    @media (max-width: 820px) {
+      .field-grid,
+      .key-row {
+        grid-template-columns: 1fr;
+      }
+
+      .pool-head,
+      .pool-foot,
+      .inline,
+      .field-row,
+      .editor-toolbar,
+      .summary-bar,
+      .section-head,
+      .base-card-head {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+
+      .pool-actions {
+        margin-left: 0;
+      }
+
+      .key-foot {
+        align-items: flex-start;
+        flex-direction: column;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="app">
+    <div class="topbar">
+      <div>
+        <h1>代理管理</h1>
+      </div>
+      <div class="topbar-stats">
+        <a class="button light" href="/admin/keys">接入 Key</a>
+      </div>
+    </div>
+
+    <div class="shell">
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>代理列表</h2>
+          </div>
+          <button class="button primary icon" id="createPoolBtn" title="新增代理">+</button>
+        </div>
+        <div class="panel-body">
+          <div class="pool-list" id="poolList"></div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2 id="editorTitle">代理编辑</h2>
+            <div class="sub" id="editorSub">先从左侧选择一个代理，或者新建一个。</div>
+          </div>
+          <span class="back-link" id="backToEmpty" style="display:none;">返回概览</span>
+        </div>
+        <div class="panel-body" id="editorRoot"></div>
+      </section>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      pools: [],
+      selectedPoolLocalId: null,
+      mode: 'empty',
+      editingBaseLocalId: null,
+      draftPool: null,
+      saveState: 'saved',
+      loadState: 'idle',
+      errorMessage: '',
+      keyTestState: {},
+      nextLocalId: 1
+    };
+
+    const poolList = document.getElementById('poolList');
+    const editorRoot = document.getElementById('editorRoot');
+    const editorTitle = document.getElementById('editorTitle');
+    const editorSub = document.getElementById('editorSub');
+    const backToEmpty = document.getElementById('backToEmpty');
+
+    function nextLocalId(prefix) {
+      const id = `${prefix}-${state.nextLocalId}`;
+      state.nextLocalId += 1;
+      return id;
+    }
+
+    function deepClone(value) {
+      return JSON.parse(JSON.stringify(value));
+    }
+
+    function protocolLabel(value) {
+      if (value === 'chat') return 'Chat';
+      if (value === 'responses') return 'Responses';
+      return 'Chat + Responses';
+    }
+
+    function saveStatusText() {
+      if (state.saveState === 'dirty') return '未保存';
+      if (state.saveState === 'saving') return '保存中';
+      if (state.saveState === 'error') return '保存失败';
+      return '已保存';
+    }
+
+    function currentPool() {
+      return state.pools.find(pool => pool.localId === state.selectedPoolLocalId) || null;
+    }
+
+    function currentEditablePool() {
+      return state.mode === 'edit' ? state.draftPool : null;
+    }
+
+    function findDraftBase(baseLocalId) {
+      return currentEditablePool()?.baseUrls.find(item => item.localId === baseLocalId) || null;
+    }
+
+    function findDraftKey(baseLocalId, keyLocalId) {
+      return findDraftBase(baseLocalId)?.keys.find(item => item.localId === keyLocalId) || null;
+    }
+
+    function collectUsedLocalIds() {
+      const used = new Set();
+
+      for (const pool of state.pools) {
+        if (!pool) continue;
+        used.add(pool.localId);
+        for (const base of pool.baseUrls || []) {
+          used.add(base.localId);
+          for (const key of base.keys || []) {
+            used.add(key.localId);
+          }
+        }
+      }
+
+      const draftPool = currentEditablePool();
+      if (draftPool) {
+        used.add(draftPool.localId);
+        for (const base of draftPool.baseUrls || []) {
+          used.add(base.localId);
+          for (const key of base.keys || []) {
+            used.add(key.localId);
+          }
+        }
+      }
+
+      return used;
+    }
+
+    function ensureNextLocalIdAvailable() {
+      const used = collectUsedLocalIds();
+      while (
+        used.has(`proxy-${state.nextLocalId}`) ||
+        used.has(`supplier-${state.nextLocalId}`) ||
+        used.has(`key-${state.nextLocalId}`)
+      ) {
+        state.nextLocalId += 1;
+      }
+    }
+
+    function syncDraftFromSelected() {
+      const pool = currentPool();
+      state.draftPool = pool ? deepClone(pool) : null;
+      state.saveState = 'saved';
+      state.errorMessage = '';
+      state.keyTestState = {};
+      state.editingBaseLocalId = null;
+    }
+
+    function markDirty() {
+      if (state.mode !== 'edit') return;
+      if (state.saveState !== 'saving') {
+        state.saveState = 'dirty';
+      }
+      state.errorMessage = '';
+    }
+
+    function hasUnsavedChanges() {
+      return state.mode === 'edit' && state.saveState === 'dirty';
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;');
+    }
+
+    function escapeAttr(value) {
+      return escapeHtml(value).replaceAll("'", '&#39;');
+    }
+
+    function mapKeyFromApi(key) {
+      return {
+        localId: `key-${key.id}`,
+        id: key.id,
+        value: key.api_key,
+        manuallyDisabled: key.manually_disabled,
+        failCount: key.fail_count,
+        banned: key.banned,
+        banUntil: key.ban_until
+      };
+    }
+
+    function mapSupplierFromApi(supplier) {
+      return {
+        localId: `supplier-${supplier.id}`,
+        id: supplier.id,
+        label: supplier.name || '',
+        protocol: supplier.protocol,
+        url: supplier.base_url,
+        keys: supplier.keys.map(mapKeyFromApi)
+      };
+    }
+
+    function mapProxyFromApi(proxy) {
+      return {
+        localId: `proxy-${proxy.id}`,
+        id: proxy.id,
+        name: proxy.name,
+        note: proxy.note || '',
+        accessKeyCount: proxy.access_key_count || 0,
+        inUse: !!proxy.in_use,
+        baseUrls: proxy.suppliers.map(mapSupplierFromApi)
+      };
+    }
+
+    function formatBanUntil(timestamp) {
+      if (!timestamp) return '';
+      try {
+        return new Date(timestamp * 1000).toLocaleString('zh-CN', {
+          hour12: false
+        });
+      } catch (_) {
+        return '';
+      }
+    }
+
+    function keyStatusText(key) {
+      if (key.manuallyDisabled) return '永久禁用';
+      if (key.banned) {
+        return `临时封禁至 ${formatBanUntil(key.banUntil)}`;
+      }
+      if (key.failCount > 0) {
+        return `失败 ${key.failCount} 次`;
+      }
+      if (!key.id && !key.value.trim()) {
+        return '未配置';
+      }
+      return '正常';
+    }
+
+    function keyTagText(key) {
+      return key.manuallyDisabled ? '停用' : '启用中';
+    }
+
+    function keyTagClass(key) {
+      return key.manuallyDisabled ? 'idle' : 'active';
+    }
+
+    function keyTestId(key) {
+      return key.id ? `saved-${key.id}` : `draft-${key.localId}`;
+    }
+
+    function keyTestMessage(key) {
+      return state.keyTestState[keyTestId(key)] || '';
+    }
+
+    function baseTitle(base) {
+      if (base.label && base.label.trim()) return base.label.trim();
+      return base.id ? `供应商 #${base.id}` : '供应商';
+    }
+
+    async function apiRequest(path, options = {}) {
+      const { method = 'GET', body } = options;
+      const url = new URL(path, `${window.location.protocol}//${window.location.host}`);
+      const response = await fetch(url, {
+        method,
+        headers: body ? { 'Content-Type': 'application/json' } : {},
+        body: body ? JSON.stringify(body) : undefined,
+        credentials: 'same-origin'
+      });
+
+      const contentType = response.headers.get('content-type') || '';
+      let payload = null;
+
+      if (contentType.includes('application/json')) {
+        payload = await response.json();
+      } else {
+        const text = await response.text();
+        payload = text ? { error: text } : null;
+      }
+
+      if (!response.ok) {
+        throw new Error(
+          payload?.error ||
+          (response.status === 401 ? '认证失效，请刷新页面重新登录' : `${response.status} ${response.statusText}`)
+        );
+      }
+
+      return payload;
+    }
+
+    async function loadProxies({ selectProxyId = null } = {}) {
+      state.loadState = 'loading';
+      render();
+
+      try {
+        const data = await apiRequest('/admin/api/proxies');
+        state.pools = (data.proxies || []).map(mapProxyFromApi);
+        state.loadState = 'ready';
+
+        if (selectProxyId != null) {
+          const selected = state.pools.find(pool => pool.id === selectProxyId) || null;
+          if (selected) {
+            state.selectedPoolLocalId = selected.localId;
+            state.mode = 'edit';
+            syncDraftFromSelected();
+          } else {
+            state.selectedPoolLocalId = null;
+            state.draftPool = null;
+            state.mode = 'empty';
+          }
+        } else if (state.selectedPoolLocalId) {
+          const currentSelected = currentPool();
+          if (currentSelected) {
+            syncDraftFromSelected();
+          } else {
+            state.selectedPoolLocalId = null;
+            state.draftPool = null;
+            state.mode = 'empty';
+            state.saveState = 'saved';
+          }
+        }
+
+        if (!state.selectedPoolLocalId && state.mode === 'empty') {
+          state.draftPool = null;
+        }
+
+        state.errorMessage = '';
+      } catch (error) {
+        state.loadState = 'error';
+        state.errorMessage = error.message || '加载失败';
+      }
+
+      render();
+    }
+
+    function selectPool(localId) {
+      state.selectedPoolLocalId = localId;
+      state.mode = 'edit';
+      syncDraftFromSelected();
+      render();
+    }
+
+    function createPool() {
+      ensureNextLocalIdAvailable();
+      const localId = nextLocalId('proxy');
+      const pool = {
+        localId,
+        id: null,
+        name: `新代理 ${state.pools.length + 1}`,
+        note: '',
+        active: false,
+        baseUrls: []
+      };
+      state.pools.unshift(pool);
+      state.selectedPoolLocalId = localId;
+      state.mode = 'edit';
+      state.draftPool = deepClone(pool);
+      state.saveState = 'dirty';
+      state.errorMessage = '';
+      render();
+    }
+
+    function addBaseUrl(poolLocalId) {
+      const pool = currentEditablePool();
+      if (!pool || pool.localId !== poolLocalId) return;
+
+      ensureNextLocalIdAvailable();
+      const base = {
+        localId: nextLocalId('supplier'),
+        id: null,
+        label: '',
+        protocol: 'both',
+        url: '',
+        keys: []
+      };
+      pool.baseUrls.push(base);
+      state.editingBaseLocalId = base.localId;
+      markDirty();
+      render();
+    }
+
+    function addKey(poolLocalId, baseLocalId) {
+      const pool = currentEditablePool();
+      if (!pool || pool.localId !== poolLocalId) return;
+      const base = findDraftBase(baseLocalId);
+      if (!base) return;
+
+      ensureNextLocalIdAvailable();
+      base.keys.push({
+        localId: nextLocalId('key'),
+        id: null,
+        value: '',
+        manuallyDisabled: false,
+        failCount: 0,
+        banned: false,
+        banUntil: null
+      });
+      markDirty();
+      render();
+    }
+
+    function removeBaseUrl(poolLocalId, baseLocalId) {
+      const pool = currentEditablePool();
+      if (!pool || pool.localId !== poolLocalId) return;
+      pool.baseUrls = pool.baseUrls.filter(item => item.localId !== baseLocalId);
+      if (state.editingBaseLocalId === baseLocalId) {
+        state.editingBaseLocalId = null;
+      }
+      markDirty();
+      render();
+    }
+
+    function removeKey(poolLocalId, baseLocalId, keyLocalId) {
+      const pool = currentEditablePool();
+      if (!pool || pool.localId !== poolLocalId) return;
+      const base = findDraftBase(baseLocalId);
+      if (!base) return;
+      base.keys = base.keys.filter(item => item.localId !== keyLocalId);
+      markDirty();
+      render();
+    }
+
+    function startBaseTitleEdit(baseLocalId) {
+      state.editingBaseLocalId = baseLocalId;
+      render();
+    }
+
+    function cancelBaseTitleEdit() {
+      state.editingBaseLocalId = null;
+      render();
+    }
+
+    function saveBaseTitle(baseLocalId) {
+      const input = document.getElementById(`base-title-input-${baseLocalId}`);
+      const base = findDraftBase(baseLocalId);
+      if (!input || !base) return;
+      base.label = input.value.trim();
+      state.editingBaseLocalId = null;
+      markDirty();
+      render();
+    }
+
+    function validateDraft(pool) {
+      const name = pool.name.trim();
+      if (!name) {
+        return '代理名称不能为空';
+      }
+
+      const seenBaseUrls = new Set();
+      for (const base of pool.baseUrls) {
+        const baseUrl = base.url.trim();
+        if (!baseUrl) {
+          return 'Base URL 不能为空';
+        }
+
+        let parsed;
+        try {
+          parsed = new URL(baseUrl);
+        } catch (_) {
+          return 'Base URL 非法';
+        }
+        if (!['http:', 'https:'].includes(parsed.protocol)) {
+          return 'Base URL 只支持 http/https';
+        }
+        const normalizedBaseUrl = baseUrl.replace(/\/+$/, '');
+        if (seenBaseUrls.has(normalizedBaseUrl)) {
+          return '同一个代理中不能重复填写 Base URL';
+        }
+        seenBaseUrls.add(normalizedBaseUrl);
+
+        const seenKeys = new Set();
+        for (const key of base.keys) {
+          const apiKey = key.value.trim();
+          if (!apiKey) {
+            return 'API Key 不能为空';
+          }
+          if (seenKeys.has(apiKey)) {
+            return '同一个供应商中不能重复填写 API Key';
+          }
+          seenKeys.add(apiKey);
+        }
+      }
+
+      return '';
+    }
+
+    function buildSavePayload(pool) {
+      return {
+        name: pool.name.trim(),
+        note: (pool.note || '').trim(),
+        suppliers: pool.baseUrls.map(base => ({
+          ...(base.id ? { id: base.id } : {}),
+          name: (base.label || '').trim(),
+          base_url: base.url.trim().replace(/\/+$/, ''),
+          protocol: base.protocol,
+          keys: base.keys.map(key => ({
+            ...(key.id ? { id: key.id } : {}),
+            api_key: key.value.trim()
+          }))
+        }))
+      };
+    }
+
+    async function saveCurrentPool() {
+      const pool = currentEditablePool();
+      if (!pool) return;
+
+      const validationError = validateDraft(pool);
+      if (validationError) {
+        state.saveState = 'error';
+        state.errorMessage = validationError;
+        render();
+        return;
+      }
+
+      state.saveState = 'saving';
+      state.errorMessage = '';
+      render();
+
+      try {
+        const payload = buildSavePayload(pool);
+        const result = pool.id
+          ? await apiRequest(`/admin/api/proxies/${pool.id}/save`, { method: 'PUT', body: payload })
+          : await apiRequest('/admin/api/proxies/save', { method: 'POST', body: payload });
+
+        await loadProxies({ selectProxyId: result.id });
+        state.saveState = 'saved';
+        state.errorMessage = '';
+        render();
+      } catch (error) {
+        state.saveState = 'error';
+        state.errorMessage = error.message || '保存失败';
+        render();
+      }
+    }
+
+    async function deletePool(poolLocalId) {
+      const pool = state.pools.find(item => item.localId === poolLocalId) || currentEditablePool();
+      if (!pool?.id) {
+        return;
+      }
+
+      if (hasUnsavedChanges()) {
+        state.saveState = 'error';
+        state.errorMessage = '请先保存或放弃当前改动';
+        render();
+        return;
+      }
+
+      const confirmed = window.confirm(`确认删除代理“${pool.name}”吗？已绑定的接入 Key 也会一并解除。`);
+      if (!confirmed) {
+        return;
+      }
+
+      state.saveState = 'saving';
+      state.errorMessage = '正在删除代理...';
+      render();
+
+      try {
+        await apiRequest(`/admin/api/proxies/${pool.id}`, { method: 'DELETE' });
+        if (state.selectedPoolLocalId === pool.localId && state.mode === 'edit') {
+          state.mode = 'empty';
+          state.selectedPoolLocalId = null;
+          state.draftPool = null;
+        }
+        state.saveState = 'saved';
+        state.errorMessage = '代理已删除';
+        await loadProxies();
+      } catch (error) {
+        state.saveState = 'error';
+        state.errorMessage = error.message || '删除失败';
+        render();
+      }
+    }
+
+    async function runKeyAction(action, keyId) {
+      if (hasUnsavedChanges()) {
+        state.saveState = 'error';
+        state.errorMessage = '请先保存当前改动';
+        render();
+        return;
+      }
+
+      const path = action === 'disable-key'
+        ? `/admin/api/keys/${keyId}/disable`
+        : action === 'enable-key'
+          ? `/admin/api/keys/${keyId}/enable`
+          : `/admin/api/keys/${keyId}/unban`;
+
+      try {
+        await apiRequest(path, { method: 'POST' });
+        const currentId = currentPool()?.id || null;
+        await loadProxies({ selectProxyId: currentId });
+      } catch (error) {
+        state.saveState = 'error';
+        state.errorMessage = error.message || '操作失败';
+        render();
+      }
+    }
+
+    async function runKeyTest(key) {
+      if (!key?.id) {
+        return;
+      }
+
+      const testId = keyTestId(key);
+      state.keyTestState[testId] = '测试中...';
+      render();
+
+      try {
+        const result = await apiRequest(`/admin/api/keys/${key.id}/test`, { method: 'POST' });
+        state.keyTestState[testId] = result?.message || (result?.ok ? '测试成功' : '测试失败');
+      } catch (error) {
+        state.keyTestState[testId] = error.message || '测试失败';
+      }
+
+      render();
+    }
+
+    function renderPoolList() {
+      if (!state.pools.length && state.loadState === 'loading') {
+        poolList.innerHTML = '<div class="empty">加载中...</div>';
+        return;
+      }
+
+      if (!state.pools.length && state.loadState === 'error') {
+        poolList.innerHTML = `<div class="empty">${escapeHtml(state.errorMessage || '加载失败')}</div>`;
+        return;
+      }
+
+      if (!state.pools.length) {
+        poolList.innerHTML = '<div class="empty">还没有代理，先新建一个。</div>';
+        return;
+      }
+
+      poolList.innerHTML = state.pools.map(pool => {
+        const baseUrlCount = pool.baseUrls.length;
+        const keyCount = pool.baseUrls.reduce((sum, item) => sum + item.keys.length, 0);
+
+        return `
+          <article class="pool-card ${pool.localId === state.selectedPoolLocalId && state.mode === 'edit' ? 'selected' : ''}" data-action="edit" data-local-id="${pool.localId}">
+            <div class="pool-head">
+              <div style="min-width:0;">
+                <div class="pool-name">${escapeHtml(pool.name)}</div>
+              </div>
+              <div class="pool-actions">
+                <span class="tag ${pool.inUse ? 'active' : 'idle'}">${pool.inUse ? '使用中' : '未接入'}</span>
+                ${pool.id ? `
+                  <button class="icon-ghost" data-action="delete-pool" data-local-id="${pool.localId}" title="删除代理" aria-label="删除代理">
+                    <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                      <path d="M4.167 5h11.666M7.5 5V3.833c0-.46.373-.833.833-.833h3.334c.46 0 .833.373.833.833V5m-6.667 0v9.167c0 .92.746 1.666 1.667 1.666h5c.92 0 1.667-.746 1.667-1.666V5M8.333 8.333v4.167M11.667 8.333v4.167" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                  </button>
+                ` : ''}
+              </div>
+            </div>
+
+            <div class="pool-foot">
+              <div class="pool-desc">供应商 ${baseUrlCount} 个 · Key ${keyCount} 个 · 接入 Key ${pool.accessKeyCount} 个</div>
+            </div>
+          </article>
+        `;
+      }).join('');
+    }
+
+    function renderEmptyEditor() {
+      editorTitle.textContent = '代理编辑';
+      editorSub.textContent = state.loadState === 'loading'
+        ? '正在加载代理列表...'
+        : state.errorMessage && state.loadState === 'error'
+          ? state.errorMessage
+          : '先从左侧选择一个代理，或者新建一个。';
+      backToEmpty.style.display = 'none';
+      editorRoot.innerHTML = `
+        <div class="editor-placeholder">
+          <div>
+            <h3>${state.loadState === 'loading' ? '加载中...' : '选择一个代理开始编辑'}</h3>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderEditor() {
+      const pool = currentEditablePool();
+      if (!pool || state.mode !== 'edit') {
+        renderEmptyEditor();
+        return;
+      }
+
+      const totalKeys = pool.baseUrls.reduce((sum, item) => sum + item.keys.length, 0);
+
+      editorTitle.textContent = `${pool.name} · 编辑`;
+      editorSub.textContent = pool.id
+        ? '编辑代理基本信息，并在下方维护供应商与 API Key。删除后会同步清理已绑定的接入 Key。'
+        : '编辑代理基本信息，并在下方维护供应商与 API Key。未保存的新代理可直接返回放弃。';
+      backToEmpty.style.display = 'inline';
+
+      editorRoot.innerHTML = `
+        <div class="editor-view">
+          <div class="editor-toolbar">
+            <div class="summary-bar" style="flex:1;">
+              <div>
+                <h3>${escapeHtml(pool.name)}</h3>
+                ${state.errorMessage ? `<div class="error-text">${escapeHtml(state.errorMessage)}</div>` : ''}
+              </div>
+              <div class="summary-items">
+                <span class="status-chip ${state.saveState}">${saveStatusText()}</span>
+                <span class="summary-chip">${pool.inUse ? '使用中' : '未接入'}</span>
+                <span class="summary-chip">接入 Key ${pool.accessKeyCount} 个</span>
+                <span class="summary-chip">供应商 ${pool.baseUrls.length} 个</span>
+                <span class="summary-chip">Key ${totalKeys} 个</span>
+              </div>
+            </div>
+            <div class="inline">
+              ${pool.id ? '<button class="button danger" data-action="delete-pool" data-local-id="' + pool.localId + '">删除代理</button>' : ''}
+              <button class="button primary" data-action="save-pool">保存</button>
+            </div>
+          </div>
+
+          <div class="editor-sections">
+            <section class="section">
+              <div class="section-head">
+                <div>
+                  <h3>基本信息</h3>
+                </div>
+              </div>
+              <div class="section-body">
+                <div class="field-grid single">
+                  <div class="field">
+                    <label>代理名称</label>
+                    <input
+                      value="${escapeAttr(pool.name)}"
+                      data-input="pool-name"
+                    />
+                  </div>
+                </div>
+                <div class="field">
+                  <label>备注说明</label>
+                  <textarea rows="3" data-input="pool-note">${escapeHtml(pool.note || '')}</textarea>
+                </div>
+              </div>
+            </section>
+
+            <section class="section">
+              <div class="section-head">
+                <div>
+                  <h3>供应商列表</h3>
+                </div>
+                <button class="button primary" data-action="add-base-url" data-local-id="${pool.localId}">+ 新增供应商</button>
+              </div>
+              <div class="section-body">
+                <div class="base-list">
+                  ${pool.baseUrls.length ? pool.baseUrls.map(base => renderBaseCard(pool, base)).join('') : '<div class="empty">这个代理还没有供应商，先新增一个。</div>'}
+                </div>
+              </div>
+            </section>
+          </div>
+
+          <div class="editor-footer">
+            ${pool.id ? '<button class="button danger" data-action="delete-pool" data-local-id="' + pool.localId + '">删除代理</button>' : ''}
+            <button class="button primary" data-action="save-pool">保存</button>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderBaseCard(pool, base) {
+      const isEditingTitle = state.editingBaseLocalId === base.localId;
+      return `
+        <article class="base-card">
+          <div class="base-card-head">
+            <div class="base-title">
+              ${isEditingTitle ? `
+                <input
+                  id="base-title-input-${base.localId}"
+                  class="base-title-input"
+                  value="${escapeAttr(base.label || '')}"
+                  placeholder="供应商名称"
+                />
+                <button class="button light icon" data-action="save-base-title" data-base-local-id="${base.localId}" title="保存">✓</button>
+                <button class="button light icon" data-action="cancel-base-title" title="取消">×</button>
+              ` : `
+                <h4>${escapeHtml(baseTitle(base))}</h4>
+                <button class="button light icon" data-action="edit-base-title" data-base-local-id="${base.localId}" title="编辑供应商名称">✎</button>
+              `}
+            </div>
+            <div class="inline">
+              <button class="button light" data-action="add-key" data-local-id="${pool.localId}" data-base-local-id="${base.localId}">+ 新增 Key</button>
+              <button class="button danger" data-action="remove-base-url" data-local-id="${pool.localId}" data-base-local-id="${base.localId}">删除</button>
+            </div>
+          </div>
+          <div class="base-card-body">
+            <div class="field-grid">
+              <div class="field">
+                <label>Base URL</label>
+                <input
+                  value="${escapeAttr(base.url)}"
+                  placeholder="https://gateway.example.com/openai"
+                  data-input="base-url"
+                  data-base-local-id="${base.localId}"
+                />
+              </div>
+              <div class="field">
+                <label>协议</label>
+                <select data-input="base-protocol" data-base-local-id="${base.localId}">
+                  <option value="both" ${base.protocol === 'both' ? 'selected' : ''}>Chat + Responses</option>
+                  <option value="chat" ${base.protocol === 'chat' ? 'selected' : ''}>Chat</option>
+                  <option value="responses" ${base.protocol === 'responses' ? 'selected' : ''}>Responses</option>
+                </select>
+              </div>
+            </div>
+
+            <div class="key-list">
+              ${base.keys.length ? base.keys.map(key => renderKeyRow(pool.localId, base.localId, key)).join('') : '<div class="empty">这个供应商还没有 Key。</div>'}
+            </div>
+          </div>
+        </article>
+      `;
+    }
+
+    function renderKeyRow(poolLocalId, baseLocalId, key) {
+      const primaryAction = key.id
+        ? (key.manuallyDisabled
+          ? `<button class="button light" data-action="enable-key" data-key-id="${key.id}">开启</button>`
+          : `<button class="button light" data-action="disable-key" data-key-id="${key.id}">禁用</button>`)
+        : '';
+      const unbanAction = key.id && key.banned && !key.manuallyDisabled
+        ? `<button class="button light" data-action="unban-key" data-key-id="${key.id}">解禁</button>`
+        : '';
+      const testAction = key.id
+        ? `<button class="button light" data-action="test-key" data-key-id="${key.id}" data-key-local-id="${key.localId}">测试</button>`
+        : '<button class="button light" disabled>测试</button>';
+      const testMessage = keyTestMessage(key);
+      const statusText = testMessage ? `${keyStatusText(key)} · ${testMessage}` : keyStatusText(key);
+
+      return `
+        <div class="key-row">
+          <div class="key-info">
+            <input
+              class="key-input"
+              value="${escapeAttr(key.value || '')}"
+              placeholder="填写 API Key"
+              autocomplete="new-password"
+              spellcheck="false"
+              data-input="key-value"
+              data-base-local-id="${baseLocalId}"
+              data-key-local-id="${key.localId}"
+            />
+          </div>
+          <div class="key-foot">
+            <div class="key-state">${escapeHtml(statusText)}</div>
+            <div class="key-actions">
+              <span class="tag ${keyTagClass(key)}">${keyTagText(key)}</span>
+              ${testAction}
+              ${primaryAction}
+              ${unbanAction}
+              <button class="button danger" data-action="remove-key" data-local-id="${poolLocalId}" data-base-local-id="${baseLocalId}" data-key-local-id="${key.localId}">删除</button>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function render() {
+      renderPoolList();
+      renderEditor();
+    }
+
+    document.getElementById('createPoolBtn').addEventListener('click', createPool);
+
+    backToEmpty.addEventListener('click', () => {
+      state.mode = 'empty';
+      state.selectedPoolLocalId = null;
+      state.draftPool = null;
+      state.saveState = 'saved';
+      state.errorMessage = '';
+      render();
+    });
+
+    document.addEventListener('input', event => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      const inputType = target.dataset?.input;
+      if (!inputType) return;
+
+      if (inputType === 'pool-name') {
+        currentEditablePool().name = target.value;
+        markDirty();
+        return;
+      }
+
+      if (inputType === 'pool-note') {
+        currentEditablePool().note = target.value;
+        markDirty();
+        return;
+      }
+
+      if (inputType === 'base-url') {
+        const base = findDraftBase(target.dataset.baseLocalId);
+        if (!base) return;
+        base.url = target.value;
+        markDirty();
+        return;
+      }
+
+      if (inputType === 'key-value') {
+        const key = findDraftKey(target.dataset.baseLocalId, target.dataset.keyLocalId);
+        if (!key) return;
+        key.value = target.value;
+        markDirty();
+      }
+    });
+
+    document.addEventListener('change', event => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      const inputType = target.dataset?.input;
+      if (inputType !== 'base-protocol') return;
+
+      const base = findDraftBase(target.dataset.baseLocalId);
+      if (!base) return;
+      base.protocol = target.value;
+      markDirty();
+      render();
+    });
+
+    document.addEventListener('click', event => {
+      const button = event.target.closest('[data-action]');
+      if (!button) return;
+
+      const { action, localId, baseLocalId, keyLocalId, keyId } = button.dataset;
+
+      if (action === 'edit') {
+        selectPool(localId);
+        return;
+      }
+
+      if (action === 'add-base-url') {
+        addBaseUrl(localId);
+        return;
+      }
+
+      if (action === 'edit-base-title') {
+        startBaseTitleEdit(baseLocalId);
+        return;
+      }
+
+      if (action === 'save-base-title') {
+        saveBaseTitle(baseLocalId);
+        return;
+      }
+
+      if (action === 'cancel-base-title') {
+        cancelBaseTitleEdit();
+        return;
+      }
+
+      if (action === 'save-pool') {
+        saveCurrentPool();
+        return;
+      }
+
+      if (action === 'delete-pool') {
+        event.stopPropagation();
+        deletePool(localId || state.selectedPoolLocalId);
+        return;
+      }
+
+      if (action === 'add-key') {
+        addKey(localId, baseLocalId);
+        return;
+      }
+
+      if (action === 'remove-base-url') {
+        removeBaseUrl(localId, baseLocalId);
+        return;
+      }
+
+      if (action === 'remove-key') {
+        removeKey(localId, baseLocalId, keyLocalId);
+        return;
+      }
+
+      if (action === 'test-key') {
+        const key = currentEditablePool()
+          ?.baseUrls.flatMap(base => base.keys)
+          .find(item => item.localId === keyLocalId || item.id === Number(keyId));
+        runKeyTest(key);
+        return;
+      }
+
+      if (action === 'disable-key' || action === 'enable-key' || action === 'unban-key') {
+        runKeyAction(action, Number(keyId));
+      }
+    });
+
+    loadProxies();
+  </script>
+</body>
+</html>
