@@ -3805,6 +3805,91 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[tokio::test]
+    async fn delete_pool_cascades_bound_access_keys_and_refreshes_state() {
+        let path = temp_db_path("delete-pool-cascade");
+        init_database(&path).unwrap();
+
+        let pool_id = {
+            let conn = open_db(&path).unwrap();
+            conn.execute(
+                "INSERT INTO pools (name, note, is_active, created_at, updated_at)
+                 VALUES ('测试代理', '备注', 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                [],
+            )
+            .unwrap();
+            let pool_id = conn.last_insert_rowid();
+
+            conn.execute(
+                "INSERT INTO pool_base_urls (pool_id, name, base_url, protocol_mode, sort_order, created_at, updated_at)
+                 VALUES (?1, '供应商 A', 'https://api.example.com/v1', 'both', 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![pool_id],
+            )
+            .unwrap();
+            let base_url_id = conn.last_insert_rowid();
+
+            conn.execute(
+                "INSERT INTO pool_api_keys (base_url_id, api_key, sort_order, manually_disabled, created_at, updated_at)
+                 VALUES (?1, 'sk-test', 0, 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![base_url_id],
+            )
+            .unwrap();
+
+            conn.execute(
+                "INSERT INTO access_keys (name, access_key, proxy_id, created_at, updated_at)
+                 VALUES (?1, ?2, ?3, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![
+                    "客户端 A",
+                    "me-1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd",
+                    pool_id
+                ],
+            )
+            .unwrap();
+
+            pool_id
+        };
+
+        let state = AppState {
+            pools: Arc::new(RwLock::new(load_pools(&path).unwrap())),
+            access_keys: Arc::new(RwLock::new(load_access_keys(&path).unwrap())),
+            runtime: Arc::new(RwLock::new(KeyRuntimeState::default())),
+            client: reqwest::Client::new(),
+            db_path: path.clone(),
+            admin: AdminCredentials {
+                username: "admin".to_string(),
+                password: "password".to_string(),
+            },
+        };
+
+        let response = delete_pool(State(state.clone()), Path(pool_id)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "{\"ok\":true}");
+
+        let conn = open_db(&path).unwrap();
+        let pool_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pools", [], |row| row.get(0))
+            .unwrap();
+        let access_key_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM access_keys", [], |row| row.get(0))
+            .unwrap();
+        let supplier_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pool_base_urls", [], |row| row.get(0))
+            .unwrap();
+        let api_key_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pool_api_keys", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(pool_count, 0);
+        assert_eq!(access_key_count, 0);
+        assert_eq!(supplier_count, 0);
+        assert_eq!(api_key_count, 0);
+        assert!(state.pools.read().await.is_empty());
+        assert!(state.access_keys.read().await.is_empty());
+
+        let _ = fs::remove_file(path);
+    }
+
     #[test]
     fn init_database_migrates_legacy_single_config_to_pool_hierarchy() {
         let path = temp_db_path("migrate");
