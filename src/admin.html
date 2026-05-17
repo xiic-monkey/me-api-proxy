@@ -477,8 +477,28 @@
     .base-card {
       border: 1px solid var(--line);
       border-radius: 14px;
-      background: #fcfcfd;
+      background: #fff;
       overflow: hidden;
+      transition: border-color 0.16s ease, box-shadow 0.16s ease, opacity 0.16s ease;
+    }
+
+    .base-card.expanded {
+      background: #fcfcfd;
+    }
+
+    .base-card.dragging {
+      opacity: 0.55;
+      box-shadow: 0 12px 28px rgba(16, 24, 40, 0.1);
+    }
+
+    .base-card.drag-over-before {
+      border-top-color: var(--blue);
+      box-shadow: 0 -3px 0 var(--blue);
+    }
+
+    .base-card.drag-over-after {
+      border-bottom-color: var(--blue);
+      box-shadow: 0 3px 0 var(--blue);
     }
 
     .base-card-head {
@@ -490,22 +510,79 @@
       border-bottom: 1px solid var(--line);
     }
 
-    .base-title {
+    .base-card.collapsed .base-card-head {
+      border-bottom: 0;
+    }
+
+    .base-card-main {
       display: flex;
       align-items: center;
+      gap: 10px;
+      min-width: 0;
+      flex: 1 1 auto;
+    }
+
+    .base-card-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
       gap: 8px;
+      flex-wrap: wrap;
+      flex: 0 0 auto;
+    }
+
+    .drag-handle {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 32px;
+      height: 32px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      color: #98a2b3;
+      cursor: grab;
+      flex: 0 0 auto;
+      transition: color 0.16s ease, background 0.16s ease, border-color 0.16s ease;
+    }
+
+    .drag-handle:hover {
+      color: var(--blue);
+      background: var(--blue-soft);
+      border-color: #bfdbfe;
+    }
+
+    .drag-handle:active {
+      cursor: grabbing;
+    }
+
+    .drag-handle svg {
+      width: 16px;
+      height: 16px;
+      display: block;
+    }
+
+    .base-summary {
+      display: grid;
+      gap: 5px;
       min-width: 0;
     }
 
-    .base-title h4 {
-      margin: 0;
+    .base-title-line {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      min-width: 0;
     }
 
-    .base-title-input {
-      width: 220px;
-      min-height: 34px;
-      padding: 6px 10px;
-      border-radius: 10px;
+    .base-url-summary {
+      min-width: 0;
+      color: var(--muted);
+      font-size: 12px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
 
     .base-card-body {
@@ -628,6 +705,19 @@
         margin-left: 0;
       }
 
+      .base-card-main,
+      .base-card-actions {
+        width: 100%;
+      }
+
+      .base-card-main {
+        align-items: flex-start;
+      }
+
+      .base-card-actions {
+        justify-content: flex-start;
+      }
+
       .key-foot {
         align-items: flex-start;
         flex-direction: column;
@@ -677,12 +767,15 @@
       pools: [],
       selectedPoolLocalId: null,
       mode: 'empty',
-      editingBaseLocalId: null,
       draftPool: null,
       saveState: 'saved',
       loadState: 'idle',
       errorMessage: '',
       keyTestState: {},
+      expandedBaseLocalIds: new Set(),
+      draggingBaseLocalId: null,
+      dragOverBaseLocalId: null,
+      dragOverPosition: null,
       nextLocalId: 1
     };
 
@@ -731,6 +824,62 @@
       return findDraftBase(baseLocalId)?.keys.find(item => item.localId === keyLocalId) || null;
     }
 
+    function isBaseExpanded(baseLocalId) {
+      return state.expandedBaseLocalIds.has(baseLocalId);
+    }
+
+    function setBaseExpanded(baseLocalId, expanded) {
+      if (expanded) {
+        state.expandedBaseLocalIds.add(baseLocalId);
+      } else {
+        state.expandedBaseLocalIds.delete(baseLocalId);
+      }
+    }
+
+    function toggleBaseExpanded(baseLocalId) {
+      setBaseExpanded(baseLocalId, !isBaseExpanded(baseLocalId));
+      render();
+    }
+
+    function resetSupplierUiState() {
+      state.expandedBaseLocalIds = new Set();
+      state.draggingBaseLocalId = null;
+      state.dragOverBaseLocalId = null;
+      state.dragOverPosition = null;
+    }
+
+    function cleanDragState() {
+      state.draggingBaseLocalId = null;
+      state.dragOverBaseLocalId = null;
+      state.dragOverPosition = null;
+    }
+
+    function clearDragClasses() {
+      document.querySelectorAll('[data-base-card]').forEach(card => {
+        card.classList.remove('dragging', 'drag-over-before', 'drag-over-after');
+      });
+    }
+
+    function reorderBaseUrls(sourceLocalId, targetLocalId, position) {
+      const pool = currentEditablePool();
+      if (!pool || !sourceLocalId || !targetLocalId || sourceLocalId === targetLocalId) return false;
+
+      const sourceIndex = pool.baseUrls.findIndex(base => base.localId === sourceLocalId);
+      const targetIndex = pool.baseUrls.findIndex(base => base.localId === targetLocalId);
+      if (sourceIndex < 0 || targetIndex < 0) return false;
+
+      const [moved] = pool.baseUrls.splice(sourceIndex, 1);
+      const targetIndexAfterRemoval = pool.baseUrls.findIndex(base => base.localId === targetLocalId);
+      if (targetIndexAfterRemoval < 0) {
+        pool.baseUrls.splice(sourceIndex, 0, moved);
+        return false;
+      }
+
+      const insertIndex = position === 'after' ? targetIndexAfterRemoval + 1 : targetIndexAfterRemoval;
+      pool.baseUrls.splice(insertIndex, 0, moved);
+      return true;
+    }
+
     function collectUsedLocalIds() {
       const used = new Set();
 
@@ -776,7 +925,7 @@
       state.saveState = 'saved';
       state.errorMessage = '';
       state.keyTestState = {};
-      state.editingBaseLocalId = null;
+      resetSupplierUiState();
     }
 
     function markDirty() {
@@ -884,6 +1033,10 @@
       return base.id ? `供应商 #${base.id}` : '供应商';
     }
 
+    function baseUrlSummary(base) {
+      return base.url && base.url.trim() ? base.url.trim() : '未填写 Base URL';
+    }
+
     async function apiRequest(path, options = {}) {
       const { method = 'GET', body } = options;
       const url = new URL(path, `${window.location.protocol}//${window.location.host}`);
@@ -983,6 +1136,7 @@
       state.draftPool = deepClone(pool);
       state.saveState = 'dirty';
       state.errorMessage = '';
+      resetSupplierUiState();
       render();
     }
 
@@ -1000,7 +1154,7 @@
         keys: []
       };
       pool.baseUrls.push(base);
-      state.editingBaseLocalId = base.localId;
+      setBaseExpanded(base.localId, true);
       markDirty();
       render();
     }
@@ -1021,6 +1175,7 @@
         banned: false,
         banUntil: null
       });
+      setBaseExpanded(base.localId, true);
       markDirty();
       render();
     }
@@ -1029,9 +1184,7 @@
       const pool = currentEditablePool();
       if (!pool || pool.localId !== poolLocalId) return;
       pool.baseUrls = pool.baseUrls.filter(item => item.localId !== baseLocalId);
-      if (state.editingBaseLocalId === baseLocalId) {
-        state.editingBaseLocalId = null;
-      }
+      state.expandedBaseLocalIds.delete(baseLocalId);
       markDirty();
       render();
     }
@@ -1042,26 +1195,6 @@
       const base = findDraftBase(baseLocalId);
       if (!base) return;
       base.keys = base.keys.filter(item => item.localId !== keyLocalId);
-      markDirty();
-      render();
-    }
-
-    function startBaseTitleEdit(baseLocalId) {
-      state.editingBaseLocalId = baseLocalId;
-      render();
-    }
-
-    function cancelBaseTitleEdit() {
-      state.editingBaseLocalId = null;
-      render();
-    }
-
-    function saveBaseTitle(baseLocalId) {
-      const input = document.getElementById(`base-title-input-${baseLocalId}`);
-      const base = findDraftBase(baseLocalId);
-      if (!input || !base) return;
-      base.label = input.value.trim();
-      state.editingBaseLocalId = null;
       markDirty();
       render();
     }
@@ -1391,38 +1524,50 @@
     }
 
     function renderBaseCard(pool, base) {
-      const isEditingTitle = state.editingBaseLocalId === base.localId;
+      const expanded = isBaseExpanded(base.localId);
+      const dragging = state.draggingBaseLocalId === base.localId;
+      const dragOverPosition = state.dragOverBaseLocalId === base.localId ? state.dragOverPosition : null;
+      const cardClasses = [
+        'base-card',
+        expanded ? 'expanded' : 'collapsed',
+        dragging ? 'dragging' : '',
+        dragOverPosition ? `drag-over-${dragOverPosition}` : ''
+      ].filter(Boolean).join(' ');
+      const keyCountText = `Key ${base.keys.length} 个`;
+
       return `
-        <article class="base-card">
+        <article class="${cardClasses}" data-base-card data-base-local-id="${base.localId}">
           <div class="base-card-head">
-            <div class="base-title">
-              ${isEditingTitle ? `
-                <input
-                  id="base-title-input-${base.localId}"
-                  class="base-title-input"
-                  value="${escapeAttr(base.label || '')}"
-                  placeholder="供应商名称"
-                />
-                <button class="button light icon" data-action="save-base-title" data-base-local-id="${base.localId}" title="保存">✓</button>
-                <button class="button light icon" data-action="cancel-base-title" title="取消">×</button>
-              ` : `
-                <h4>${escapeHtml(baseTitle(base))}</h4>
-                <button class="button light icon" data-action="edit-base-title" data-base-local-id="${base.localId}" title="编辑供应商名称">✎</button>
-              `}
+            <div class="base-card-main">
+              <button class="drag-handle" type="button" draggable="true" data-drag-handle data-base-local-id="${base.localId}" title="拖动调整供应商顺序" aria-label="拖动调整供应商顺序">
+                <svg viewBox="0 0 20 20" fill="none" aria-hidden="true">
+                  <path d="M7 5.5h.01M13 5.5h.01M7 10h.01M13 10h.01M7 14.5h.01M13 14.5h.01" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+                </svg>
+              </button>
+              <div class="base-summary">
+                <div class="base-title-line">
+                  <h4>${escapeHtml(baseTitle(base))}</h4>
+                  <span class="tag idle">${escapeHtml(protocolLabel(base.protocol))}</span>
+                  <span class="summary-chip">${keyCountText}</span>
+                </div>
+                <div class="base-url-summary">${escapeHtml(baseUrlSummary(base))}</div>
+              </div>
             </div>
-            <div class="inline">
+            <div class="base-card-actions">
+              <button class="button light" data-action="toggle-base" data-base-local-id="${base.localId}">${expanded ? '收起' : '展开'}</button>
               <button class="button light" data-action="add-key" data-local-id="${pool.localId}" data-base-local-id="${base.localId}">+ 新增 Key</button>
               <button class="button danger" data-action="remove-base-url" data-local-id="${pool.localId}" data-base-local-id="${base.localId}">删除</button>
             </div>
           </div>
+          ${expanded ? `
           <div class="base-card-body">
             <div class="field-grid">
               <div class="field">
-                <label>Base URL</label>
+                <label>供应商名称</label>
                 <input
-                  value="${escapeAttr(base.url)}"
-                  placeholder="https://gateway.example.com/openai"
-                  data-input="base-url"
+                  value="${escapeAttr(base.label || '')}"
+                  placeholder="供应商名称"
+                  data-input="base-name"
                   data-base-local-id="${base.localId}"
                 />
               </div>
@@ -1436,10 +1581,23 @@
               </div>
             </div>
 
+            <div class="field-grid single">
+              <div class="field">
+                <label>Base URL</label>
+                <input
+                  value="${escapeAttr(base.url)}"
+                  placeholder="https://gateway.example.com/openai"
+                  data-input="base-url"
+                  data-base-local-id="${base.localId}"
+                />
+              </div>
+            </div>
+
             <div class="key-list">
               ${base.keys.length ? base.keys.map(key => renderKeyRow(pool.localId, base.localId, key)).join('') : '<div class="empty">这个供应商还没有 Key。</div>'}
             </div>
           </div>
+          ` : ''}
         </article>
       `;
     }
@@ -1500,6 +1658,7 @@
       state.draftPool = null;
       state.saveState = 'saved';
       state.errorMessage = '';
+      resetSupplierUiState();
       render();
     });
 
@@ -1525,6 +1684,14 @@
         const base = findDraftBase(target.dataset.baseLocalId);
         if (!base) return;
         base.url = target.value;
+        markDirty();
+        return;
+      }
+
+      if (inputType === 'base-name') {
+        const base = findDraftBase(target.dataset.baseLocalId);
+        if (!base) return;
+        base.label = target.value;
         markDirty();
         return;
       }
@@ -1566,18 +1733,8 @@
         return;
       }
 
-      if (action === 'edit-base-title') {
-        startBaseTitleEdit(baseLocalId);
-        return;
-      }
-
-      if (action === 'save-base-title') {
-        saveBaseTitle(baseLocalId);
-        return;
-      }
-
-      if (action === 'cancel-base-title') {
-        cancelBaseTitleEdit();
+      if (action === 'toggle-base') {
+        toggleBaseExpanded(baseLocalId);
         return;
       }
 
@@ -1618,6 +1775,77 @@
       if (action === 'disable-key' || action === 'enable-key' || action === 'unban-key') {
         runKeyAction(action, Number(keyId));
       }
+    });
+
+    document.addEventListener('dragstart', event => {
+      const handle = event.target.closest('[data-drag-handle]');
+      if (!handle) return;
+
+      const baseLocalId = handle.dataset.baseLocalId;
+      if (!findDraftBase(baseLocalId)) return;
+
+      state.draggingBaseLocalId = baseLocalId;
+      state.dragOverBaseLocalId = null;
+      state.dragOverPosition = null;
+
+      event.dataTransfer.effectAllowed = 'move';
+      event.dataTransfer.setData('text/plain', baseLocalId);
+      handle.closest('[data-base-card]')?.classList.add('dragging');
+    });
+
+    document.addEventListener('dragover', event => {
+      const card = event.target.closest('[data-base-card]');
+      if (!card || !state.draggingBaseLocalId) return;
+
+      const targetLocalId = card.dataset.baseLocalId;
+      if (!targetLocalId || targetLocalId === state.draggingBaseLocalId) return;
+
+      event.preventDefault();
+      event.dataTransfer.dropEffect = 'move';
+
+      const rect = card.getBoundingClientRect();
+      const position = event.clientY > rect.top + rect.height / 2 ? 'after' : 'before';
+
+      if (state.dragOverBaseLocalId !== targetLocalId || state.dragOverPosition !== position) {
+        document.querySelectorAll('[data-base-card]').forEach(item => {
+          item.classList.remove('drag-over-before', 'drag-over-after');
+        });
+        state.dragOverBaseLocalId = targetLocalId;
+        state.dragOverPosition = position;
+        card.classList.add(`drag-over-${position}`);
+      }
+    });
+
+    document.addEventListener('dragleave', event => {
+      const card = event.target.closest('[data-base-card]');
+      if (!card || card.contains(event.relatedTarget)) return;
+      card.classList.remove('drag-over-before', 'drag-over-after');
+      if (state.dragOverBaseLocalId === card.dataset.baseLocalId) {
+        state.dragOverBaseLocalId = null;
+        state.dragOverPosition = null;
+      }
+    });
+
+    document.addEventListener('drop', event => {
+      const card = event.target.closest('[data-base-card]');
+      if (!card || !state.draggingBaseLocalId) return;
+
+      event.preventDefault();
+      const targetLocalId = card.dataset.baseLocalId;
+      const position = state.dragOverPosition || 'before';
+      const didMove = reorderBaseUrls(state.draggingBaseLocalId, targetLocalId, position);
+      cleanDragState();
+      clearDragClasses();
+
+      if (didMove) {
+        markDirty();
+        render();
+      }
+    });
+
+    document.addEventListener('dragend', () => {
+      cleanDragState();
+      clearDragClasses();
     });
 
     loadProxies();
