@@ -1037,6 +1037,10 @@
       return base.url && base.url.trim() ? base.url.trim() : '未填写 Base URL';
     }
 
+    function defaultSelectedPool() {
+      return state.pools.find(pool => pool.inUse) || null;
+    }
+
     async function apiRequest(path, options = {}) {
       const { method = 'GET', body } = options;
       const url = new URL(path, `${window.location.protocol}//${window.location.host}`);
@@ -1092,10 +1096,24 @@
           if (currentSelected) {
             syncDraftFromSelected();
           } else {
-            state.selectedPoolLocalId = null;
-            state.draftPool = null;
-            state.mode = 'empty';
-            state.saveState = 'saved';
+            const fallbackPool = defaultSelectedPool();
+            if (fallbackPool) {
+              state.selectedPoolLocalId = fallbackPool.localId;
+              state.mode = 'edit';
+              syncDraftFromSelected();
+            } else {
+              state.selectedPoolLocalId = null;
+              state.draftPool = null;
+              state.mode = 'empty';
+              state.saveState = 'saved';
+            }
+          }
+        } else {
+          const fallbackPool = defaultSelectedPool();
+          if (fallbackPool) {
+            state.selectedPoolLocalId = fallbackPool.localId;
+            state.mode = 'edit';
+            syncDraftFromSelected();
           }
         }
 
