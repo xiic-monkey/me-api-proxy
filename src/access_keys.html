@@ -229,6 +229,12 @@
       font-size: 12px;
     }
 
+    .usage-text {
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 4px;
+    }
+
     .actions {
       display: flex;
       align-items: center;
@@ -355,6 +361,22 @@
       }
     }
 
+    function formatRelativeTime(timestamp) {
+      if (!timestamp) return '';
+      const diff = Math.max(0, Math.floor(Date.now() / 1000) - Number(timestamp));
+      if (diff < 60) return '刚刚';
+      if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+      if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`;
+      return formatTime(timestamp);
+    }
+
+    function lastUsedText(item) {
+      if (!item.lastUsedAt || !item.lastUsedSupplierName || !item.lastUsedKeyMasked) {
+        return '最近命中：暂无';
+      }
+      return `最近命中：${item.lastUsedSupplierName} / ${item.lastUsedKeyMasked} · ${formatRelativeTime(item.lastUsedAt)}`;
+    }
+
     function mapAccessKey(item) {
       return {
         localId: `saved-${item.id}`,
@@ -365,6 +387,9 @@
         proxyName: item.proxy_name,
         createdAt: item.created_at,
         updatedAt: item.updated_at,
+        lastUsedSupplierName: item.last_used_supplier_name || '',
+        lastUsedKeyMasked: item.last_used_key_masked || '',
+        lastUsedAt: item.last_used_at || null,
         saving: false,
         error: ''
       };
@@ -540,6 +565,7 @@
           <div class="meta">
             <div>
               <div>当前代理：${escapeHtml(item.proxyName || currentProxyName(item.proxyId) || '-')}</div>
+              <div class="usage-text">${escapeHtml(lastUsedText(item))}</div>
               <div>创建于：${escapeHtml(formatTime(item.createdAt))}　更新于：${escapeHtml(formatTime(item.updatedAt))}</div>
               ${item.error ? `<div style="color:var(--red); margin-top:4px;">${escapeHtml(item.error)}</div>` : ''}
             </div>

@@ -52,6 +52,7 @@ struct AppState {
     pools: Arc<RwLock<Vec<PoolConfig>>>,
     access_keys: Arc<RwLock<Vec<AccessKeyConfig>>>,
     runtime: Arc<RwLock<KeyRuntimeState>>,
+    usage: Arc<RwLock<UsageRuntimeState>>,
     client: reqwest::Client,
     db_path: PathBuf,
     admin: AdminCredentials,
@@ -184,6 +185,28 @@ impl Default for KeyRuntimeState {
             keys: HashMap::new(),
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AccessKeyUsage {
+    access_key_id: i64,
+    proxy_id: i64,
+    supplier_id: i64,
+    key_id: i64,
+    used_at: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct KeyUsage {
+    access_key_id: i64,
+    supplier_id: i64,
+    used_at: i64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct UsageRuntimeState {
+    by_access_key: HashMap<i64, AccessKeyUsage>,
+    by_key: HashMap<i64, KeyUsage>,
 }
 
 #[derive(Debug, Serialize)]
@@ -319,6 +342,8 @@ struct SupplierView {
     available_key_count: usize,
     total_key_count: usize,
     schedulable: bool,
+    last_used_at: Option<i64>,
+    last_used_by_access_key_name: Option<String>,
     keys: Vec<ApiKeyView>,
 }
 
@@ -332,6 +357,9 @@ struct ApiKeyView {
     fail_count: u32,
     banned: bool,
     ban_until: Option<i64>,
+    last_used: bool,
+    last_used_at: Option<i64>,
+    last_used_by_access_key_name: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -350,6 +378,9 @@ struct AccessKeyView {
     proxy_name: String,
     created_at: i64,
     updated_at: i64,
+    last_used_supplier_name: Option<String>,
+    last_used_key_masked: Option<String>,
+    last_used_at: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1079,12 +1110,14 @@ async fn reload_pools(state: &AppState) -> Result<(), String> {
             .retain(|key_id, _| valid_key_ids.contains(key_id));
     }
     *state.pools.write().await = pools;
+    reconcile_usage_runtime(state).await;
     Ok(())
 }
 
 async fn reload_access_keys(state: &AppState) -> Result<(), String> {
     let access_keys = load_access_keys(&state.db_path)?;
     *state.access_keys.write().await = access_keys;
+    reconcile_usage_runtime(state).await;
     Ok(())
 }
 
@@ -1943,6 +1976,98 @@ async fn clear_key_runtime(state: &AppState, key_id: i64) {
     state.runtime.write().await.keys.remove(&key_id);
 }
 
+async fn record_key_usage(
+    state: &AppState,
+    access_key_id: i64,
+    proxy_id: i64,
+    supplier_id: i64,
+    key_id: i64,
+) {
+    let used_at = Local::now().timestamp();
+    let mut usage = state.usage.write().await;
+    usage.by_access_key.insert(
+        access_key_id,
+        AccessKeyUsage {
+            access_key_id,
+            proxy_id,
+            supplier_id,
+            key_id,
+            used_at,
+        },
+    );
+    usage.by_key.insert(
+        key_id,
+        KeyUsage {
+            access_key_id,
+            supplier_id,
+            used_at,
+        },
+    );
+}
+
+async fn clear_access_key_usage(state: &AppState, access_key_id: i64) {
+    let mut usage = state.usage.write().await;
+    usage.by_access_key.remove(&access_key_id);
+    usage.by_key
+        .retain(|_, item| item.access_key_id != access_key_id);
+}
+
+async fn clear_access_key_usages<I>(state: &AppState, access_key_ids: I)
+where
+    I: IntoIterator<Item = i64>,
+{
+    let access_key_ids: HashSet<i64> = access_key_ids.into_iter().collect();
+    if access_key_ids.is_empty() {
+        return;
+    }
+
+    let mut usage = state.usage.write().await;
+    for access_key_id in &access_key_ids {
+        usage.by_access_key.remove(access_key_id);
+    }
+    usage.by_key
+        .retain(|_, item| !access_key_ids.contains(&item.access_key_id));
+}
+
+async fn clear_supplier_usage(state: &AppState, supplier_id: i64) {
+    let mut usage = state.usage.write().await;
+    usage.by_access_key
+        .retain(|_, item| item.supplier_id != supplier_id);
+    usage.by_key.retain(|_, item| item.supplier_id != supplier_id);
+}
+
+async fn reconcile_usage_runtime(state: &AppState) {
+    let pools = state.pools.read().await.clone();
+    let access_keys = state.access_keys.read().await.clone();
+
+    let valid_access_keys: HashSet<i64> = access_keys.iter().map(|item| item.id).collect();
+    let valid_pools: HashSet<i64> = pools.iter().map(|pool| pool.id).collect();
+    let mut valid_suppliers = HashSet::new();
+    let mut valid_keys = HashSet::new();
+
+    for pool in &pools {
+        for supplier in &pool.base_urls {
+            valid_suppliers.insert(supplier.id);
+            for key in &supplier.api_keys {
+                valid_keys.insert(key.id);
+            }
+        }
+    }
+
+    let mut usage = state.usage.write().await;
+    usage.by_access_key.retain(|_, item| {
+        valid_access_keys.contains(&item.access_key_id)
+            && valid_pools.contains(&item.proxy_id)
+            && valid_suppliers.contains(&item.supplier_id)
+            && valid_keys.contains(&item.key_id)
+    });
+    usage.by_key.retain(|key_id, item| {
+        valid_keys.contains(key_id)
+            && valid_access_keys.contains(&item.access_key_id)
+            && valid_suppliers.contains(&item.supplier_id)
+    });
+}
+
 async fn clear_key_runtimes<I>(state: &AppState, key_ids: I)
 where
     I: IntoIterator<Item = i64>,
@@ -1987,14 +2112,19 @@ fn mask_key(api_key: &str) -> String {
 async fn pools_response(state: &AppState) -> ProxiesResponse {
     let pools = state.pools.read().await.clone();
     let access_keys = state.access_keys.read().await.clone();
+    let usage = state.usage.read().await.clone();
     let now = Local::now();
     let mut runtime = state.runtime.write().await;
     ensure_runtime_day(&mut runtime, now);
 
-    let binding_counts = access_keys.into_iter().fold(HashMap::new(), |mut map, access_key| {
+    let binding_counts = access_keys.iter().fold(HashMap::new(), |mut map, access_key| {
         *map.entry(access_key.proxy_id).or_insert(0usize) += 1;
         map
     });
+    let access_key_names: HashMap<i64, String> = access_keys
+        .iter()
+        .map(|item| (item.id, item.name.clone()))
+        .collect();
     let proxies = pools
         .into_iter()
         .map(|pool| {
@@ -2005,6 +2135,12 @@ async fn pools_response(state: &AppState) -> ProxiesResponse {
                 .into_iter()
                 .map(|base_url| {
                     let mut available_key_count = 0usize;
+                    let supplier_usage = base_url
+                        .api_keys
+                        .iter()
+                        .filter_map(|key| usage.by_key.get(&key.id))
+                        .max_by_key(|item| item.used_at)
+                        .cloned();
                     let keys = base_url
                         .api_keys
                         .into_iter()
@@ -2022,6 +2158,13 @@ async fn pools_response(state: &AppState) -> ProxiesResponse {
                                 fail_count: availability.fail_count,
                                 banned: availability.banned,
                                 ban_until: availability.ban_until,
+                                last_used: usage.by_key.contains_key(&key.id),
+                                last_used_at: usage.by_key.get(&key.id).map(|item| item.used_at),
+                                last_used_by_access_key_name: usage
+                                    .by_key
+                                    .get(&key.id)
+                                    .and_then(|item| access_key_names.get(&item.access_key_id))
+                                    .cloned(),
                             }
                         })
                         .collect::<Vec<_>>();
@@ -2039,6 +2182,11 @@ async fn pools_response(state: &AppState) -> ProxiesResponse {
                         available_key_count,
                         total_key_count: keys.len(),
                         schedulable,
+                        last_used_at: supplier_usage.as_ref().map(|item| item.used_at),
+                        last_used_by_access_key_name: supplier_usage
+                            .as_ref()
+                            .and_then(|item| access_key_names.get(&item.access_key_id))
+                            .cloned(),
                         keys,
                     }
                 })
@@ -2079,10 +2227,22 @@ async fn get_proxies(State(state): State<AppState>) -> Json<ProxiesResponse> {
 async fn access_keys_response(state: &AppState) -> AccessKeysResponse {
     let access_keys = state.access_keys.read().await.clone();
     let pools = state.pools.read().await.clone();
+    let usage = state.usage.read().await.clone();
 
     let proxy_names: HashMap<i64, String> = pools
         .iter()
         .map(|pool| (pool.id, pool.name.clone()))
+        .collect();
+    let supplier_names: HashMap<i64, String> = pools
+        .iter()
+        .flat_map(|pool| pool.base_urls.iter())
+        .map(|supplier| (supplier.id, supplier.name.clone()))
+        .collect();
+    let masked_key_by_id: HashMap<i64, String> = pools
+        .iter()
+        .flat_map(|pool| pool.base_urls.iter())
+        .flat_map(|supplier| supplier.api_keys.iter())
+        .map(|key| (key.id, mask_key(&key.api_key)))
         .collect();
     let proxies = pools
         .into_iter()
@@ -2106,6 +2266,20 @@ async fn access_keys_response(state: &AppState) -> AccessKeysResponse {
                 .unwrap_or_else(|| "已删除代理".to_string()),
             created_at: access_key.created_at,
             updated_at: access_key.updated_at,
+            last_used_supplier_name: usage
+                .by_access_key
+                .get(&access_key.id)
+                .and_then(|item| supplier_names.get(&item.supplier_id))
+                .cloned(),
+            last_used_key_masked: usage
+                .by_access_key
+                .get(&access_key.id)
+                .and_then(|item| masked_key_by_id.get(&item.key_id))
+                .cloned(),
+            last_used_at: usage
+                .by_access_key
+                .get(&access_key.id)
+                .map(|item| item.used_at),
         })
         .collect();
 
@@ -2547,13 +2721,32 @@ async fn update_access_key(
         Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
 
+    let current_proxy_id: Option<i64> = match conn
+        .query_row(
+            "SELECT proxy_id FROM access_keys WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()
+    {
+        Ok(value) => value,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load access key: {err}"),
+            )
+        }
+    };
+    let Some(current_proxy_id) = current_proxy_id else {
+        return json_error(StatusCode::NOT_FOUND, "access key not found");
+    };
+
     match conn.execute(
         "UPDATE access_keys
          SET name = ?1, proxy_id = ?2, updated_at = strftime('%s', 'now')
          WHERE id = ?3",
         params![name, payload.proxy_id, id],
     ) {
-        Ok(0) => return json_error(StatusCode::NOT_FOUND, "access key not found"),
         Ok(_) => {}
         Err(err) => {
             return json_error(
@@ -2563,6 +2756,9 @@ async fn update_access_key(
         }
     }
 
+    if current_proxy_id != payload.proxy_id {
+        clear_access_key_usage(&state, id).await;
+    }
     if let Err(err) = reload_access_keys(&state).await {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
     }
@@ -2586,6 +2782,7 @@ async fn delete_access_key(State(state): State<AppState>, Path(id): Path<i64>) -
         }
     }
 
+    clear_access_key_usage(&state, id).await;
     if let Err(err) = reload_access_keys(&state).await {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
     }
@@ -2629,6 +2826,40 @@ async fn delete_pool(State(state): State<AppState>, Path(id): Path<i64>) -> Resp
         return json_error(StatusCode::NOT_FOUND, "proxy not found");
     };
 
+    let bound_access_key_ids = {
+        let mut stmt = match conn.prepare("SELECT id FROM access_keys WHERE proxy_id = ?1") {
+            Ok(stmt) => stmt,
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to prepare bound access key query: {err}"),
+                )
+            }
+        };
+        let rows = match stmt.query_map(params![id], |row| row.get::<_, i64>(0)) {
+            Ok(rows) => rows,
+            Err(err) => {
+                return json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("Failed to query bound access keys: {err}"),
+                )
+            }
+        };
+        let mut ids = Vec::new();
+        for row in rows {
+            match row {
+                Ok(value) => ids.push(value),
+                Err(err) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("Failed to decode bound access key: {err}"),
+                    )
+                }
+            }
+        }
+        ids
+    };
+
     if let Err(err) = conn.execute("DELETE FROM pools WHERE id = ?1", params![id]) {
         return json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2661,6 +2892,7 @@ async fn delete_pool(State(state): State<AppState>, Path(id): Path<i64>) -> Resp
         }
     }
 
+    clear_access_key_usages(&state, bound_access_key_ids).await;
     if let Err(err) = reload_state(&state).await {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
     }
@@ -2846,6 +3078,7 @@ async fn delete_base_url(State(state): State<AppState>, Path(id): Path<i64>) -> 
     if let Err(err) = normalize_base_url_orders(&conn, pool_id) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
     }
+    clear_supplier_usage(&state, id).await;
     if let Err(err) = reload_pools(&state).await {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
     }
@@ -3358,6 +3591,7 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                             );
                         }
                         mark_key_success(&state, key.id).await;
+                        record_key_usage(&state, access_key.id, pool.id, base_url.id, key.id).await;
                         let mut downstream = Response::builder().status(response.status());
                         if let Some(headers_mut) = downstream.headers_mut() {
                             match response_headers(
@@ -3493,6 +3727,7 @@ async fn main() {
         pools: Arc::new(RwLock::new(pools)),
         access_keys: Arc::new(RwLock::new(access_keys)),
         runtime: Arc::new(RwLock::new(KeyRuntimeState::default())),
+        usage: Arc::new(RwLock::new(UsageRuntimeState::default())),
         client: build_client(),
         db_path,
         admin,
@@ -3575,6 +3810,21 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    fn test_app_state(path: &PathBuf) -> AppState {
+        AppState {
+            pools: Arc::new(RwLock::new(load_pools(path).unwrap())),
+            access_keys: Arc::new(RwLock::new(load_access_keys(path).unwrap())),
+            runtime: Arc::new(RwLock::new(KeyRuntimeState::default())),
+            usage: Arc::new(RwLock::new(UsageRuntimeState::default())),
+            client: reqwest::Client::new(),
+            db_path: path.clone(),
+            admin: AdminCredentials {
+                username: "admin".to_string(),
+                password: "password".to_string(),
+            },
+        }
     }
 
     #[test]
@@ -3806,6 +4056,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn record_key_usage_updates_runtime_state() {
+        let path = temp_db_path("record-usage");
+        init_database(&path).unwrap();
+
+        let (pool_id, supplier_id, key_id, access_key_id) = {
+            let conn = open_db(&path).unwrap();
+            conn.execute(
+                "INSERT INTO pools (name, note, is_active, created_at, updated_at)
+                 VALUES ('测试代理', '', 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                [],
+            )
+            .unwrap();
+            let pool_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO pool_base_urls (pool_id, name, base_url, protocol_mode, sort_order, created_at, updated_at)
+                 VALUES (?1, '供应商 A', 'https://api.example.com/v1', 'both', 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![pool_id],
+            )
+            .unwrap();
+            let supplier_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO pool_api_keys (base_url_id, api_key, sort_order, manually_disabled, created_at, updated_at)
+                 VALUES (?1, 'sk-test-1234567890', 0, 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![supplier_id],
+            )
+            .unwrap();
+            let key_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO access_keys (name, access_key, proxy_id, created_at, updated_at)
+                 VALUES ('客户端 A', 'me-1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd', ?1, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![pool_id],
+            )
+            .unwrap();
+            let access_key_id = conn.last_insert_rowid();
+            (pool_id, supplier_id, key_id, access_key_id)
+        };
+
+        let state = test_app_state(&path);
+        record_key_usage(&state, access_key_id, pool_id, supplier_id, key_id).await;
+
+        let usage = state.usage.read().await;
+        let access_usage = usage.by_access_key.get(&access_key_id).unwrap();
+        assert_eq!(access_usage.proxy_id, pool_id);
+        assert_eq!(access_usage.supplier_id, supplier_id);
+        assert_eq!(access_usage.key_id, key_id);
+        assert!(usage.by_key.contains_key(&key_id));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn access_key_and_pool_responses_include_last_used_summary() {
+        let path = temp_db_path("usage-response");
+        init_database(&path).unwrap();
+
+        let (pool_id, supplier_id, key_id, access_key_id) = {
+            let conn = open_db(&path).unwrap();
+            conn.execute(
+                "INSERT INTO pools (name, note, is_active, created_at, updated_at)
+                 VALUES ('测试代理', '', 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                [],
+            )
+            .unwrap();
+            let pool_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO pool_base_urls (pool_id, name, base_url, protocol_mode, sort_order, created_at, updated_at)
+                 VALUES (?1, 'OpenAI', 'https://api.example.com/v1', 'both', 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![pool_id],
+            )
+            .unwrap();
+            let supplier_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO pool_api_keys (base_url_id, api_key, sort_order, manually_disabled, created_at, updated_at)
+                 VALUES (?1, 'sk-test-1234567890', 0, 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![supplier_id],
+            )
+            .unwrap();
+            let key_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO access_keys (name, access_key, proxy_id, created_at, updated_at)
+                 VALUES ('客户端 A', 'me-1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd', ?1, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![pool_id],
+            )
+            .unwrap();
+            let access_key_id = conn.last_insert_rowid();
+            (pool_id, supplier_id, key_id, access_key_id)
+        };
+
+        let state = test_app_state(&path);
+        record_key_usage(&state, access_key_id, pool_id, supplier_id, key_id).await;
+
+        let access_keys = access_keys_response(&state).await;
+        assert_eq!(access_keys.access_keys.len(), 1);
+        assert_eq!(
+            access_keys.access_keys[0].last_used_supplier_name.as_deref(),
+            Some("OpenAI")
+        );
+        assert_eq!(
+            access_keys.access_keys[0].last_used_key_masked.as_deref(),
+            Some("sk-tes...7890")
+        );
+        assert!(access_keys.access_keys[0].last_used_at.is_some());
+
+        let proxies = pools_response(&state).await;
+        assert_eq!(proxies.proxies.len(), 1);
+        assert_eq!(
+            proxies.proxies[0].suppliers[0]
+                .last_used_by_access_key_name
+                .as_deref(),
+            Some("客户端 A")
+        );
+        assert!(proxies.proxies[0].suppliers[0].keys[0].last_used);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
     async fn delete_pool_cascades_bound_access_keys_and_refreshes_state() {
         let path = temp_db_path("delete-pool-cascade");
         init_database(&path).unwrap();
@@ -3849,17 +4216,7 @@ mod tests {
             pool_id
         };
 
-        let state = AppState {
-            pools: Arc::new(RwLock::new(load_pools(&path).unwrap())),
-            access_keys: Arc::new(RwLock::new(load_access_keys(&path).unwrap())),
-            runtime: Arc::new(RwLock::new(KeyRuntimeState::default())),
-            client: reqwest::Client::new(),
-            db_path: path.clone(),
-            admin: AdminCredentials {
-                username: "admin".to_string(),
-                password: "password".to_string(),
-            },
-        };
+        let state = test_app_state(&path);
 
         let response = delete_pool(State(state.clone()), Path(pool_id)).await;
         assert_eq!(response.status(), StatusCode::OK);

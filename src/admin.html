@@ -319,13 +319,20 @@
       gap: 16px;
     }
 
-    .editor-toolbar,
+    .editor-toolbar {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      align-items: start;
+      gap: 12px;
+    }
+
     .summary-bar {
       display: flex;
-      align-items: center;
+      align-items: flex-start;
       justify-content: space-between;
       gap: 12px;
       flex-wrap: wrap;
+      min-height: 100%;
     }
 
     .summary-bar {
@@ -339,6 +346,7 @@
       display: flex;
       gap: 8px;
       flex-wrap: wrap;
+      justify-content: flex-end;
     }
 
     .summary-chip {
@@ -693,12 +701,15 @@
       .pool-foot,
       .inline,
       .field-row,
-      .editor-toolbar,
       .summary-bar,
       .section-head,
       .base-card-head {
         align-items: flex-start;
         flex-direction: column;
+      }
+
+      .editor-toolbar {
+        grid-template-columns: 1fr;
       }
 
       .pool-actions {
@@ -960,7 +971,10 @@
         manuallyDisabled: key.manually_disabled,
         failCount: key.fail_count,
         banned: key.banned,
-        banUntil: key.ban_until
+        banUntil: key.ban_until,
+        lastUsed: !!key.last_used,
+        lastUsedAt: key.last_used_at || null,
+        lastUsedByAccessKeyName: key.last_used_by_access_key_name || ''
       };
     }
 
@@ -971,6 +985,8 @@
         label: supplier.name || '',
         protocol: supplier.protocol,
         url: supplier.base_url,
+        lastUsedAt: supplier.last_used_at || null,
+        lastUsedByAccessKeyName: supplier.last_used_by_access_key_name || '',
         keys: supplier.keys.map(mapKeyFromApi)
       };
     }
@@ -996,6 +1012,27 @@
       } catch (_) {
         return '';
       }
+    }
+
+    function formatUsageTime(timestamp) {
+      if (!timestamp) return '';
+      try {
+        return new Date(timestamp * 1000).toLocaleTimeString('zh-CN', {
+          hour12: false,
+          hour: '2-digit',
+          minute: '2-digit'
+        });
+      } catch (_) {
+        return '';
+      }
+    }
+
+    function formatRelativeUsage(timestamp) {
+      if (!timestamp) return '';
+      const diff = Math.max(0, Math.floor(Date.now() / 1000) - Number(timestamp));
+      if (diff < 60) return '刚刚';
+      if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`;
+      return formatUsageTime(timestamp);
     }
 
     function keyStatusText(key) {
@@ -1035,6 +1072,18 @@
 
     function baseUrlSummary(base) {
       return base.url && base.url.trim() ? base.url.trim() : '未填写 Base URL';
+    }
+
+    function supplierUsageText(base) {
+      if (!base.lastUsedAt) return '';
+      const accessKeyName = base.lastUsedByAccessKeyName ? ` · ${base.lastUsedByAccessKeyName}` : '';
+      return `最近命中${accessKeyName} · ${formatRelativeUsage(base.lastUsedAt)}`;
+    }
+
+    function keyLastUsedText(key) {
+      if (!key.lastUsedAt) return '';
+      const accessKeyName = key.lastUsedByAccessKeyName ? `最近用于 ${key.lastUsedByAccessKeyName}` : '最近命中';
+      return `${accessKeyName} · ${formatRelativeUsage(key.lastUsedAt)}`;
     }
 
     function defaultSelectedPool() {
@@ -1511,10 +1560,6 @@
                     />
                   </div>
                 </div>
-                <div class="field">
-                  <label>备注说明</label>
-                  <textarea rows="3" data-input="pool-note">${escapeHtml(pool.note || '')}</textarea>
-                </div>
               </div>
             </section>
 
@@ -1552,6 +1597,7 @@
         dragOverPosition ? `drag-over-${dragOverPosition}` : ''
       ].filter(Boolean).join(' ');
       const keyCountText = `Key ${base.keys.length} 个`;
+      const usageText = supplierUsageText(base);
 
       return `
         <article class="${cardClasses}" data-base-card data-base-local-id="${base.localId}">
@@ -1567,8 +1613,10 @@
                   <h4>${escapeHtml(baseTitle(base))}</h4>
                   <span class="tag idle">${escapeHtml(protocolLabel(base.protocol))}</span>
                   <span class="summary-chip">${keyCountText}</span>
+                  ${usageText ? '<span class="summary-chip">最近命中</span>' : ''}
                 </div>
                 <div class="base-url-summary">${escapeHtml(baseUrlSummary(base))}</div>
+                ${usageText ? `<div class="base-url-summary">${escapeHtml(usageText)}</div>` : ''}
               </div>
             </div>
             <div class="base-card-actions">
@@ -1633,7 +1681,11 @@
         ? `<button class="button light" data-action="test-key" data-key-id="${key.id}" data-key-local-id="${key.localId}">测试</button>`
         : '<button class="button light" disabled>测试</button>';
       const testMessage = keyTestMessage(key);
-      const statusText = testMessage ? `${keyStatusText(key)} · ${testMessage}` : keyStatusText(key);
+      const usageText = keyLastUsedText(key);
+      const statusParts = [keyStatusText(key)];
+      if (usageText) statusParts.push(usageText);
+      if (testMessage) statusParts.push(testMessage);
+      const statusText = statusParts.join(' · ');
 
       return `
         <div class="key-row">
@@ -1688,12 +1740,6 @@
 
       if (inputType === 'pool-name') {
         currentEditablePool().name = target.value;
-        markDirty();
-        return;
-      }
-
-      if (inputType === 'pool-note') {
-        currentEditablePool().note = target.value;
         markDirty();
         return;
       }
