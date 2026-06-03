@@ -1940,12 +1940,28 @@ fn key_availability_in_state(
     }
 }
 
-fn mark_key_fail_in_state(key_id: i64, state: &mut KeyRuntimeState, now: DateTime<Local>) {
+fn pool_has_single_supplier_and_key(pool: &PoolConfig) -> bool {
+    pool.base_urls.len() == 1
+        && pool
+            .base_urls
+            .first()
+            .map(|base_url| base_url.api_keys.len() == 1)
+            .unwrap_or(false)
+}
+
+fn mark_key_fail_in_state(
+    key_id: i64,
+    state: &mut KeyRuntimeState,
+    now: DateTime<Local>,
+    allow_ban: bool,
+) {
     ensure_runtime_day(state, now);
     let entry = state.keys.entry(key_id).or_default();
     clear_expired_ban(entry, now);
     entry.fail_count += 1;
-    if entry.fail_count >= DAILY_BAN_FAILS {
+    if !allow_ban {
+        entry.ban_until = None;
+    } else if entry.fail_count >= DAILY_BAN_FAILS {
         entry.ban_until = Some(next_day_zero(now));
     } else if entry.fail_count >= TEMP_BAN_FAILS {
         entry.ban_until = Some(now + ChronoDuration::minutes(TEMP_BAN_MINUTES));
@@ -1962,9 +1978,9 @@ async fn key_is_schedulable(state: &AppState, key: &ApiKeyConfig) -> bool {
     key_availability_in_state(key, &mut runtime, Local::now()).schedulable
 }
 
-async fn mark_key_fail(state: &AppState, key_id: i64) {
+async fn mark_key_fail(state: &AppState, key_id: i64, allow_ban: bool) {
     let mut runtime = state.runtime.write().await;
-    mark_key_fail_in_state(key_id, &mut runtime, Local::now());
+    mark_key_fail_in_state(key_id, &mut runtime, Local::now(), allow_ban);
 }
 
 async fn mark_key_success(state: &AppState, key_id: i64) {
@@ -3482,6 +3498,7 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
     };
     let is_streaming = is_stream_request(&buffered_body);
     let mut last_error: Option<ProxyAttemptError> = None;
+    let allow_auto_ban = !pool_has_single_supplier_and_key(&pool);
     let request_body_preview = if path == RESPONSES_PATH {
         Some(String::from_utf8_lossy(&buffered_body).chars().take(800).collect::<String>())
     } else {
@@ -3569,11 +3586,14 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                                 upstream_url_text
                             );
                         }
-                        mark_key_fail(&state, key.id).await;
+                        mark_key_fail(&state, key.id, allow_auto_ban).await;
                         last_error = Some(ProxyAttemptError {
                             body: format!("Upstream returned {}", status.as_u16()),
                         });
 
+                        if !allow_auto_ban {
+                            break;
+                        }
                         if key_is_schedulable(&state, &key).await {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             continue;
@@ -3658,11 +3678,14 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                                 upstream_url_text
                             );
                         }
-                        mark_key_fail(&state, key.id).await;
+                        mark_key_fail(&state, key.id, allow_auto_ban).await;
                         last_error = Some(ProxyAttemptError {
                             body: "Gateway Timeout".to_string(),
                         });
 
+                        if !allow_auto_ban {
+                            break;
+                        }
                         if key_is_schedulable(&state, &key).await {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             continue;
@@ -3679,11 +3702,14 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                                 err
                             );
                         }
-                        mark_key_fail(&state, key.id).await;
+                        mark_key_fail(&state, key.id, allow_auto_ban).await;
                         last_error = Some(ProxyAttemptError {
                             body: format!("Bad Gateway: {err}"),
                         });
 
+                        if !allow_auto_ban {
+                            break;
+                        }
                         if key_is_schedulable(&state, &key).await {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             continue;
@@ -3965,13 +3991,13 @@ mod tests {
         let mut state = KeyRuntimeState::default();
         state.last_reset_date = now.date_naive();
 
-        mark_key_fail_in_state(key.id, &mut state, now);
-        mark_key_fail_in_state(key.id, &mut state, now);
+        mark_key_fail_in_state(key.id, &mut state, now, true);
+        mark_key_fail_in_state(key.id, &mut state, now, true);
         let availability = key_availability_in_state(&key, &mut state, now);
         assert_eq!(availability.fail_count, 2);
         assert!(availability.schedulable);
 
-        mark_key_fail_in_state(key.id, &mut state, now);
+        mark_key_fail_in_state(key.id, &mut state, now, true);
         let availability = key_availability_in_state(&key, &mut state, now);
         assert_eq!(availability.fail_count, 3);
         assert!(availability.banned);
@@ -3981,20 +4007,43 @@ mod tests {
         assert_eq!(availability.fail_count, 3);
         assert!(!availability.banned);
 
-        mark_key_fail_in_state(key.id, &mut state, after_temp_ban);
+        mark_key_fail_in_state(key.id, &mut state, after_temp_ban, true);
         let after_second_temp_ban = after_temp_ban + ChronoDuration::minutes(6);
-        mark_key_fail_in_state(key.id, &mut state, after_second_temp_ban);
+        mark_key_fail_in_state(key.id, &mut state, after_second_temp_ban, true);
         let availability = key_availability_in_state(&key, &mut state, after_second_temp_ban);
         assert_eq!(availability.fail_count, 5);
         assert!(availability.banned);
     }
 
     #[test]
+    fn single_supplier_single_key_failures_do_not_ban() {
+        let key = ApiKeyConfig {
+            id: 1,
+            base_url_id: 1,
+            api_key: "sk-test".to_string(),
+            sort_order: 0,
+            manually_disabled: false,
+        };
+        let now = fixed_now();
+        let mut state = KeyRuntimeState::default();
+        state.last_reset_date = now.date_naive();
+
+        for _ in 0..DAILY_BAN_FAILS + 2 {
+            mark_key_fail_in_state(key.id, &mut state, now, false);
+        }
+
+        let availability = key_availability_in_state(&key, &mut state, now);
+        assert_eq!(availability.fail_count, DAILY_BAN_FAILS + 2);
+        assert!(!availability.banned);
+        assert!(availability.schedulable);
+    }
+
+    #[test]
     fn key_success_clears_runtime_state() {
         let now = fixed_now();
         let mut state = KeyRuntimeState::default();
-        mark_key_fail_in_state(1, &mut state, now);
-        mark_key_fail_in_state(1, &mut state, now);
+        mark_key_fail_in_state(1, &mut state, now, true);
+        mark_key_fail_in_state(1, &mut state, now, true);
         assert!(state.keys.contains_key(&1));
 
         mark_key_success_in_state(1, &mut state, now);
