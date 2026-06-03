@@ -148,9 +148,12 @@
       font: inherit;
       font-size: 12px;
       font-weight: 600;
+      line-height: 1;
+      white-space: nowrap;
       cursor: pointer;
       text-decoration: none;
       transition: 0.16s ease;
+      flex: 0 0 auto;
     }
 
     .button.primary {
@@ -408,6 +411,9 @@
     .editor-footer {
       display: flex;
       justify-content: flex-end;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
       padding-top: 4px;
     }
 
