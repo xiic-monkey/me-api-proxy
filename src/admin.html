@@ -335,7 +335,6 @@
       justify-content: space-between;
       gap: 12px;
       flex-wrap: wrap;
-      min-height: 100%;
     }
 
     .summary-bar {
@@ -345,8 +344,16 @@
       background: #fbfcfe;
     }
 
+    .summary-main {
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+      flex: 1 1 220px;
+    }
+
     .summary-items {
       display: flex;
+      align-items: flex-start;
       gap: 8px;
       flex-wrap: wrap;
       justify-content: flex-end;
@@ -1531,7 +1538,7 @@
         <div class="editor-view">
           <div class="editor-toolbar">
             <div class="summary-bar" style="flex:1;">
-              <div>
+              <div class="summary-main">
                 <h3>${escapeHtml(pool.name)}</h3>
                 ${state.errorMessage ? `<div class="error-text">${escapeHtml(state.errorMessage)}</div>` : ''}
               </div>
