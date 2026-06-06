@@ -61,6 +61,7 @@
       display: flex;
       flex-direction: column;
       min-height: 0;
+      min-width: 0;
     }
 
     .panel-head {
@@ -77,6 +78,7 @@
     .panel-body {
       flex: 1 1 auto;
       min-height: 0;
+      min-width: 0;
       overflow: auto;
       padding: 18px 20px 20px;
     }
@@ -219,6 +221,7 @@
     .pool-list {
       display: grid;
       gap: 12px;
+      min-width: 0;
     }
 
     .pool-card {
@@ -230,6 +233,7 @@
       background: #fff;
       transition: 0.18s ease;
       cursor: pointer;
+      min-width: 0;
     }
 
     .pool-card.selected {
@@ -256,6 +260,7 @@
       font-size: 16px;
       font-weight: 700;
       letter-spacing: -0.02em;
+      overflow-wrap: anywhere;
     }
 
     .pool-meta {
@@ -267,6 +272,7 @@
     .pool-desc {
       color: var(--muted);
       font-size: 12px;
+      overflow-wrap: anywhere;
     }
 
     .pool-actions {
@@ -320,21 +326,20 @@
     .editor-view {
       display: grid;
       gap: 16px;
+      align-content: start;
     }
 
     .editor-toolbar {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
-      align-items: start;
-      gap: 12px;
+      min-width: 0;
     }
 
     .summary-bar {
       display: flex;
-      align-items: flex-start;
+      align-items: center;
       justify-content: space-between;
       gap: 12px;
       flex-wrap: wrap;
+      min-width: 0;
     }
 
     .summary-bar {
@@ -351,16 +356,43 @@
       flex: 1 1 220px;
     }
 
+    .summary-main h3 {
+      overflow-wrap: anywhere;
+    }
+
+    .summary-side {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 10px;
+      flex: 1 1 auto;
+      min-width: 0;
+      flex-wrap: wrap;
+    }
+
     .summary-items {
       display: flex;
-      align-items: flex-start;
+      align-items: center;
       gap: 8px;
       flex-wrap: wrap;
       justify-content: flex-end;
+      min-width: 0;
+    }
+
+    .summary-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      flex-wrap: wrap;
+      flex: 0 0 auto;
     }
 
     .summary-chip {
-      padding: 6px 10px;
+      display: inline-flex;
+      align-items: center;
+      height: 28px;
+      padding: 0 10px;
       border-radius: 999px;
       background: #fff;
       border: 1px solid var(--line);
@@ -413,6 +445,7 @@
     .editor-sections {
       display: grid;
       gap: 14px;
+      min-width: 0;
     }
 
     .editor-footer {
@@ -429,6 +462,7 @@
       border-radius: 16px;
       background: #fff;
       overflow: hidden;
+      min-width: 0;
     }
 
     .section-head {
@@ -445,6 +479,7 @@
       padding: 16px;
       display: grid;
       gap: 12px;
+      min-width: 0;
     }
 
     .field-grid {
@@ -460,6 +495,7 @@
     .field {
       display: grid;
       gap: 6px;
+      min-width: 0;
     }
 
     .field label {
@@ -493,6 +529,7 @@
     .key-list {
       display: grid;
       gap: 10px;
+      min-width: 0;
     }
 
     .base-card {
@@ -501,6 +538,7 @@
       background: #fff;
       overflow: hidden;
       transition: border-color 0.16s ease, box-shadow 0.16s ease, opacity 0.16s ease;
+      min-width: 0;
     }
 
     .base-card.expanded {
@@ -529,6 +567,7 @@
       gap: 10px;
       padding: 14px 14px 12px;
       border-bottom: 1px solid var(--line);
+      min-width: 0;
     }
 
     .base-card.collapsed .base-card-head {
@@ -597,6 +636,10 @@
       min-width: 0;
     }
 
+    .base-title-line h4 {
+      overflow-wrap: anywhere;
+    }
+
     .base-url-summary {
       min-width: 0;
       color: var(--muted);
@@ -610,6 +653,7 @@
       padding: 14px;
       display: grid;
       gap: 12px;
+      min-width: 0;
     }
 
     .key-row {
@@ -619,6 +663,7 @@
       border: 1px solid var(--line);
       border-radius: 12px;
       background: #fff;
+      min-width: 0;
     }
 
     .key-info {
@@ -644,6 +689,7 @@
       justify-content: space-between;
       gap: 10px;
       flex-wrap: wrap;
+      min-width: 0;
     }
 
     .key-actions {
@@ -651,6 +697,7 @@
       align-items: center;
       gap: 8px;
       flex-wrap: wrap;
+      justify-content: flex-end;
     }
 
     .empty {
@@ -1537,22 +1584,24 @@
       editorRoot.innerHTML = `
         <div class="editor-view">
           <div class="editor-toolbar">
-            <div class="summary-bar" style="flex:1;">
+            <div class="summary-bar">
               <div class="summary-main">
                 <h3>${escapeHtml(pool.name)}</h3>
                 ${state.errorMessage ? `<div class="error-text">${escapeHtml(state.errorMessage)}</div>` : ''}
               </div>
-              <div class="summary-items">
-                <span class="status-chip ${state.saveState}">${saveStatusText()}</span>
-                <span class="summary-chip">${pool.inUse ? '使用中' : '未接入'}</span>
-                <span class="summary-chip">接入 Key ${pool.accessKeyCount} 个</span>
-                <span class="summary-chip">供应商 ${pool.baseUrls.length} 个</span>
-                <span class="summary-chip">Key ${totalKeys} 个</span>
+              <div class="summary-side">
+                <div class="summary-items">
+                  <span class="status-chip ${state.saveState}">${saveStatusText()}</span>
+                  <span class="summary-chip">${pool.inUse ? '使用中' : '未接入'}</span>
+                  <span class="summary-chip">接入 Key ${pool.accessKeyCount} 个</span>
+                  <span class="summary-chip">供应商 ${pool.baseUrls.length} 个</span>
+                  <span class="summary-chip">Key ${totalKeys} 个</span>
+                </div>
+                <div class="summary-actions">
+                  ${pool.id ? '<button class="button danger" data-action="delete-pool" data-local-id="' + pool.localId + '">删除代理</button>' : ''}
+                  <button class="button primary" data-action="save-pool">保存</button>
+                </div>
               </div>
-            </div>
-            <div class="inline">
-              ${pool.id ? '<button class="button danger" data-action="delete-pool" data-local-id="' + pool.localId + '">删除代理</button>' : ''}
-              <button class="button primary" data-action="save-pool">保存</button>
             </div>
           </div>
 
