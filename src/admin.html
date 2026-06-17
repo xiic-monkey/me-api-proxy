@@ -721,6 +721,138 @@
       text-decoration: underline;
     }
 
+    .modal-root {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(16, 24, 40, 0.42);
+      backdrop-filter: blur(6px);
+      z-index: 40;
+    }
+
+    .modal-root.visible {
+      display: flex;
+    }
+
+    .modal-card {
+      width: min(760px, 100%);
+      max-height: min(88vh, 920px);
+      overflow: hidden;
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+      border-radius: 22px;
+      border: 1px solid rgba(230, 234, 240, 0.9);
+      background: rgba(255, 255, 255, 0.96);
+      box-shadow: 0 24px 72px rgba(16, 24, 40, 0.22);
+    }
+
+    .modal-head,
+    .modal-foot {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 18px 20px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .modal-foot {
+      border-top: 1px solid var(--line);
+      border-bottom: 0;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+    }
+
+    .modal-body {
+      min-height: 0;
+      overflow: auto;
+      padding: 18px 20px 20px;
+      display: grid;
+      gap: 14px;
+      align-content: start;
+    }
+
+    .modal-sub {
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .protocol-group,
+    .radio-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .inline-radio-group {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .radio-card {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fff;
+      cursor: pointer;
+      transition: border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
+    }
+
+    .radio-card:hover {
+      border-color: #bfd5ff;
+      background: #fbfdff;
+    }
+
+    .radio-card.selected {
+      border-color: #8ab4ff;
+      background: #f7fbff;
+      box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.08);
+    }
+
+    .radio-card input {
+      width: auto;
+      margin-top: 2px;
+      flex: 0 0 auto;
+    }
+
+    .radio-copy {
+      display: grid;
+      gap: 4px;
+      min-width: 0;
+    }
+
+    .radio-title {
+      font-weight: 600;
+      overflow-wrap: anywhere;
+    }
+
+    .radio-note {
+      color: var(--muted);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
+
+    .model-list {
+      max-height: 360px;
+      overflow: auto;
+      padding-right: 4px;
+    }
+
+    .model-empty {
+      padding: 18px 14px;
+      border: 1px dashed var(--line);
+      border-radius: 14px;
+      color: var(--muted);
+      text-align: center;
+      background: #fafbfc;
+    }
+
     @media (max-width: 1180px) {
       body {
         height: auto;
@@ -833,6 +965,8 @@
     </div>
   </div>
 
+  <div class="modal-root" id="testModalRoot" aria-hidden="true"></div>
+
   <script>
     const state = {
       pools: [],
@@ -843,6 +977,21 @@
       loadState: 'idle',
       errorMessage: '',
       keyTestState: {},
+      testModal: {
+        open: false,
+        keyId: null,
+        keyLocalId: null,
+        supplierLabel: '',
+        loadState: 'idle',
+        submitState: 'idle',
+        errorMessage: '',
+        submitError: '',
+        models: [],
+        filter: '',
+        selectedModel: '',
+        selectedProtocol: '',
+        supplierProtocol: 'chat'
+      },
       expandedBaseLocalIds: new Set(),
       draggingBaseLocalId: null,
       dragOverBaseLocalId: null,
@@ -855,6 +1004,7 @@
     const editorTitle = document.getElementById('editorTitle');
     const editorSub = document.getElementById('editorSub');
     const backToEmpty = document.getElementById('backToEmpty');
+    const testModalRoot = document.getElementById('testModalRoot');
 
     function nextLocalId(prefix) {
       const id = `${prefix}-${state.nextLocalId}`;
@@ -996,6 +1146,7 @@
       state.saveState = 'saved';
       state.errorMessage = '';
       state.keyTestState = {};
+      closeTestModal();
       resetSupplierUiState();
     }
 
@@ -1029,6 +1180,8 @@
         id: key.id,
         value: key.api_key,
         manuallyDisabled: key.manually_disabled,
+        testModel: key.test_model || '',
+        testProtocol: key.test_protocol || '',
         failCount: key.fail_count,
         banned: key.banned,
         banUntil: key.ban_until,
@@ -1123,6 +1276,59 @@
 
     function keyTestMessage(key) {
       return state.keyTestState[keyTestId(key)] || '';
+    }
+
+    function protocolLabelShort(value) {
+      return value === 'responses' ? 'Responses' : 'Chat';
+    }
+
+    function normalizeModalProtocol(supplierProtocol, selectedProtocol) {
+      if (supplierProtocol === 'both') {
+        return selectedProtocol === 'responses' ? 'responses' : 'chat';
+      }
+      return supplierProtocol;
+    }
+
+    function modalModelOptions() {
+      const filter = state.testModal.filter.trim().toLowerCase();
+      if (!filter) return state.testModal.models;
+      return state.testModal.models.filter(item => item.value.toLowerCase().includes(filter));
+    }
+
+    function openTestModalSkeleton(key, base) {
+      state.testModal = {
+        open: true,
+        keyId: key.id,
+        keyLocalId: key.localId,
+        supplierLabel: baseTitle(base),
+        loadState: 'loading',
+        submitState: 'idle',
+        errorMessage: '',
+        submitError: '',
+        models: [],
+        filter: '',
+        selectedModel: key.testModel || '',
+        selectedProtocol: normalizeModalProtocol(base.protocol, key.testProtocol || ''),
+        supplierProtocol: base.protocol
+      };
+    }
+
+    function closeTestModal() {
+      state.testModal = {
+        open: false,
+        keyId: null,
+        keyLocalId: null,
+        supplierLabel: '',
+        loadState: 'idle',
+        submitState: 'idle',
+        errorMessage: '',
+        submitError: '',
+        models: [],
+        filter: '',
+        selectedModel: '',
+        selectedProtocol: '',
+        supplierProtocol: 'chat'
+      };
     }
 
     function baseTitle(base) {
@@ -1298,6 +1504,8 @@
         id: null,
         value: '',
         manuallyDisabled: false,
+        testModel: '',
+        testProtocol: '',
         failCount: 0,
         banned: false,
         banUntil: null
@@ -1484,23 +1692,188 @@
       }
     }
 
-    async function runKeyTest(key) {
-      if (!key?.id) {
-        return;
-      }
+    async function loadTestModels() {
+      const { keyId } = state.testModal;
+      if (!keyId) return;
 
-      const testId = keyTestId(key);
-      state.keyTestState[testId] = '测试中...';
+      state.testModal.loadState = 'loading';
+      state.testModal.errorMessage = '';
+      state.testModal.submitError = '';
       render();
 
       try {
-        const result = await apiRequest(`/admin/api/keys/${key.id}/test`, { method: 'POST' });
-        state.keyTestState[testId] = result?.message || (result?.ok ? '测试成功' : '测试失败');
+        const result = await apiRequest(`/admin/api/keys/${keyId}/models`);
+        const selectedModel = result?.selected_model || state.testModal.selectedModel || '';
+        const rememberedMissing = selectedModel && !(result.models || []).includes(selectedModel);
+        const models = [
+          ...(rememberedMissing ? [{
+            value: selectedModel,
+            stale: true
+          }] : []),
+          ...((result.models || []).map(model => ({
+            value: model,
+            stale: false
+          })))
+        ];
+
+        state.testModal.models = models;
+        state.testModal.selectedModel = selectedModel;
+        state.testModal.selectedProtocol = normalizeModalProtocol(
+          result?.supplier_protocol || state.testModal.supplierProtocol,
+          result?.selected_protocol || state.testModal.selectedProtocol
+        );
+        state.testModal.supplierProtocol = result?.supplier_protocol || state.testModal.supplierProtocol;
+        state.testModal.loadState = 'ready';
       } catch (error) {
-        state.keyTestState[testId] = error.message || '测试失败';
+        state.testModal.loadState = 'error';
+        state.testModal.errorMessage = error.message || '加载模型失败';
       }
 
       render();
+    }
+
+    async function runKeyTest(key, base) {
+      if (!key?.id || !base) return;
+      openTestModalSkeleton(key, base);
+      render();
+      await loadTestModels();
+    }
+
+    async function submitKeyTest() {
+      if (!state.testModal.keyId || !state.testModal.selectedModel || state.testModal.submitState === 'saving') {
+        return;
+      }
+
+      state.testModal.submitState = 'saving';
+      state.testModal.submitError = '';
+      const key = currentEditablePool()
+        ?.baseUrls.flatMap(base => base.keys)
+        .find(item => item.localId === state.testModal.keyLocalId || item.id === state.testModal.keyId);
+      if (key) {
+        state.keyTestState[keyTestId(key)] = '测试中...';
+      }
+      render();
+
+      try {
+        const body = {
+          model: state.testModal.selectedModel,
+          ...(state.testModal.supplierProtocol === 'both'
+            ? { protocol: state.testModal.selectedProtocol }
+            : {})
+        };
+        const result = await apiRequest(`/admin/api/keys/${state.testModal.keyId}/test`, {
+          method: 'POST',
+          body
+        });
+
+        const currentId = currentPool()?.id || null;
+        await loadProxies({ selectProxyId: currentId });
+        const refreshedKey = currentEditablePool()
+          ?.baseUrls.flatMap(base => base.keys)
+          .find(item => item.id === state.testModal.keyId);
+        if (refreshedKey) {
+          state.keyTestState[keyTestId(refreshedKey)] = result?.message || (result?.ok ? '测试成功' : '测试失败');
+        }
+        closeTestModal();
+      } catch (error) {
+        state.testModal.submitState = 'idle';
+        state.testModal.submitError = error.message || '测试失败';
+        const activeKey = currentEditablePool()
+          ?.baseUrls.flatMap(base => base.keys)
+          .find(item => item.id === state.testModal.keyId);
+        if (activeKey) {
+          state.keyTestState[keyTestId(activeKey)] = '测试失败';
+        }
+      }
+
+      render();
+    }
+
+    function renderTestModal() {
+      if (!state.testModal.open) {
+        testModalRoot.className = 'modal-root';
+        testModalRoot.setAttribute('aria-hidden', 'true');
+        testModalRoot.innerHTML = '';
+        return;
+      }
+
+      const visibleModels = modalModelOptions();
+      const showProtocol = state.testModal.supplierProtocol === 'both';
+      const canSubmit = state.testModal.loadState === 'ready'
+        && !!state.testModal.selectedModel
+        && (!showProtocol || !!state.testModal.selectedProtocol)
+        && state.testModal.submitState !== 'saving';
+
+      testModalRoot.className = 'modal-root visible';
+      testModalRoot.setAttribute('aria-hidden', 'false');
+      testModalRoot.innerHTML = `
+        <div class="modal-card" role="dialog" aria-modal="true" aria-label="真实测试">
+          <div class="modal-head">
+            <div>
+              <h3>真实测试</h3>
+              <div class="modal-sub">${escapeHtml(state.testModal.supplierLabel)}</div>
+            </div>
+            <button class="button light" data-action="close-test-modal">关闭</button>
+          </div>
+          <div class="modal-body">
+            ${state.testModal.loadState === 'loading' ? '<div class="empty">正在加载模型列表...</div>' : ''}
+            ${state.testModal.loadState === 'error' ? `
+              <div class="empty">${escapeHtml(state.testModal.errorMessage || '加载模型失败')}</div>
+              <div class="inline-radio-group">
+                <button class="button light" data-action="reload-test-models">重试</button>
+              </div>
+            ` : ''}
+            ${state.testModal.loadState === 'ready' ? `
+              ${showProtocol ? `
+                <div class="protocol-group">
+                  <div class="field">
+                    <label>测试协议</label>
+                  </div>
+                  <div class="inline-radio-group">
+                    ${['chat', 'responses'].map(protocol => `
+                      <label class="radio-card ${state.testModal.selectedProtocol === protocol ? 'selected' : ''}">
+                        <input type="radio" name="test-protocol" value="${protocol}" data-input="test-protocol" ${state.testModal.selectedProtocol === protocol ? 'checked' : ''} />
+                        <div class="radio-copy">
+                          <div class="radio-title">${protocolLabelShort(protocol)}</div>
+                          <div class="radio-note">使用 ${protocolLabelShort(protocol)} 接口发送固定的 hi 请求</div>
+                        </div>
+                      </label>
+                    `).join('')}
+                  </div>
+                </div>
+              ` : ''}
+              <div class="field">
+                <label>选择模型</label>
+                <input
+                  value="${escapeAttr(state.testModal.filter)}"
+                  placeholder="搜索模型名"
+                  data-input="test-model-filter"
+                />
+              </div>
+              <div class="model-list">
+                <div class="radio-list">
+                  ${visibleModels.length ? visibleModels.map(item => `
+                    <label class="radio-card ${state.testModal.selectedModel === item.value ? 'selected' : ''}">
+                      <input type="radio" name="test-model" value="${escapeAttr(item.value)}" data-input="test-model" ${state.testModal.selectedModel === item.value ? 'checked' : ''} />
+                      <div class="radio-copy">
+                        <div class="radio-title">${escapeHtml(item.value)}</div>
+                        ${item.stale ? '<div class="radio-note">上次选择，当前模型列表未返回</div>' : ''}
+                      </div>
+                    </label>
+                  `).join('') : '<div class="model-empty">没有匹配的模型</div>'}
+                </div>
+              </div>
+              ${state.testModal.submitError ? `<div class="error-text">${escapeHtml(state.testModal.submitError)}</div>` : ''}
+            ` : ''}
+          </div>
+          <div class="modal-foot">
+            <button class="button light" data-action="close-test-modal" ${state.testModal.submitState === 'saving' ? 'disabled' : ''}>取消</button>
+            <button class="button primary" data-action="submit-key-test" ${canSubmit ? '' : 'disabled'}>
+              ${state.testModal.submitState === 'saving' ? '测试中...' : '发送 hi 测试'}
+            </button>
+          </div>
+        </div>
+      `;
     }
 
     function renderPoolList() {
@@ -1780,6 +2153,7 @@
     function render() {
       renderPoolList();
       renderEditor();
+      renderTestModal();
     }
 
     document.getElementById('createPoolBtn').addEventListener('click', createPool);
@@ -1827,6 +2201,12 @@
         if (!key) return;
         key.value = target.value;
         markDirty();
+        return;
+      }
+
+      if (inputType === 'test-model-filter') {
+        state.testModal.filter = target.value;
+        render();
       }
     });
 
@@ -1834,13 +2214,27 @@
       const target = event.target;
       if (!(target instanceof HTMLElement)) return;
       const inputType = target.dataset?.input;
-      if (inputType !== 'base-protocol') return;
+      if (inputType === 'base-protocol') {
+        const base = findDraftBase(target.dataset.baseLocalId);
+        if (!base) return;
+        base.protocol = target.value;
+        markDirty();
+        render();
+        return;
+      }
 
-      const base = findDraftBase(target.dataset.baseLocalId);
-      if (!base) return;
-      base.protocol = target.value;
-      markDirty();
-      render();
+      if (inputType === 'test-protocol') {
+        state.testModal.selectedProtocol = target.value;
+        state.testModal.submitError = '';
+        render();
+        return;
+      }
+
+      if (inputType === 'test-model') {
+        state.testModal.selectedModel = target.value;
+        state.testModal.submitError = '';
+        render();
+      }
     });
 
     document.addEventListener('click', event => {
@@ -1891,10 +2285,27 @@
       }
 
       if (action === 'test-key') {
-        const key = currentEditablePool()
-          ?.baseUrls.flatMap(base => base.keys)
-          .find(item => item.localId === keyLocalId || item.id === Number(keyId));
-        runKeyTest(key);
+        const base = currentEditablePool()
+          ?.baseUrls.find(item => item.keys.some(key => key.localId === keyLocalId || key.id === Number(keyId)));
+        const key = base?.keys.find(item => item.localId === keyLocalId || item.id === Number(keyId));
+        runKeyTest(key, base);
+        return;
+      }
+
+      if (action === 'close-test-modal') {
+        if (state.testModal.submitState === 'saving') return;
+        closeTestModal();
+        render();
+        return;
+      }
+
+      if (action === 'reload-test-models') {
+        loadTestModels();
+        return;
+      }
+
+      if (action === 'submit-key-test') {
+        submitKeyTest();
         return;
       }
 
@@ -1972,6 +2383,13 @@
     document.addEventListener('dragend', () => {
       cleanDragState();
       clearDragClasses();
+    });
+
+    document.addEventListener('keydown', event => {
+      if (event.key !== 'Escape') return;
+      if (!state.testModal.open || state.testModal.submitState === 'saving') return;
+      closeTestModal();
+      render();
     });
 
     loadProxies();

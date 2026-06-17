@@ -114,6 +114,41 @@ impl OpenAiEndpoint {
     }
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum TestProtocol {
+    Chat,
+    Responses,
+}
+
+impl TestProtocol {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Chat => "chat",
+            Self::Responses => "responses",
+        }
+    }
+
+    fn from_str(value: &str) -> Result<Self, String> {
+        match value {
+            "chat" => Ok(Self::Chat),
+            "responses" => Ok(Self::Responses),
+            _ => Err("protocol must be chat or responses".to_string()),
+        }
+    }
+
+    fn from_saved(value: &str) -> Option<Self> {
+        Self::from_str(value).ok()
+    }
+
+    fn endpoint(self) -> OpenAiEndpoint {
+        match self {
+            Self::Chat => OpenAiEndpoint::Chat,
+            Self::Responses => OpenAiEndpoint::Responses,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ConversionMode {
     Direct,
@@ -154,6 +189,8 @@ struct ApiKeyConfig {
     api_key: String,
     sort_order: i64,
     manually_disabled: bool,
+    test_model: String,
+    test_protocol: Option<TestProtocol>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -230,6 +267,20 @@ struct KeyTestResponse {
     ok: bool,
     message: String,
     status_code: Option<u16>,
+}
+
+#[derive(Debug, Serialize)]
+struct KeyModelsResponse {
+    models: Vec<String>,
+    selected_model: Option<String>,
+    selected_protocol: Option<TestProtocol>,
+    supplier_protocol: ProtocolMode,
+}
+
+#[derive(Debug, Deserialize)]
+struct KeyTestRequest {
+    model: String,
+    protocol: Option<TestProtocol>,
 }
 
 #[derive(Debug, Clone)]
@@ -354,6 +405,8 @@ struct ApiKeyView {
     masked_key: String,
     sort_order: i64,
     manually_disabled: bool,
+    test_model: Option<String>,
+    test_protocol: Option<TestProtocol>,
     fail_count: u32,
     banned: bool,
     ban_until: Option<i64>,
@@ -509,6 +562,8 @@ fn init_database(path: &PathBuf) -> Result<(), String> {
             api_key TEXT NOT NULL,
             sort_order INTEGER NOT NULL DEFAULT 0,
             manually_disabled INTEGER NOT NULL DEFAULT 0,
+            test_model TEXT NOT NULL DEFAULT '',
+            test_protocol TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
             updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
             FOREIGN KEY (base_url_id) REFERENCES pool_base_urls(id) ON DELETE CASCADE
@@ -550,6 +605,22 @@ fn init_database(path: &PathBuf) -> Result<(), String> {
             [],
         )
         .map_err(|err| format!("Failed to add supplier protocol column: {err}"))?;
+    }
+
+    let api_key_columns = table_columns(&conn, "pool_api_keys")?;
+    if !api_key_columns.contains("test_model") {
+        conn.execute(
+            "ALTER TABLE pool_api_keys ADD COLUMN test_model TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(|err| format!("Failed to add api_key test model column: {err}"))?;
+    }
+    if !api_key_columns.contains("test_protocol") {
+        conn.execute(
+            "ALTER TABLE pool_api_keys ADD COLUMN test_protocol TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(|err| format!("Failed to add api_key test protocol column: {err}"))?;
     }
 
     migrate_legacy_openai_config(&conn)?;
@@ -1020,6 +1091,7 @@ fn load_pools(path: &PathBuf) -> Result<Vec<PoolConfig>, String> {
             let mut key_stmt = conn
                 .prepare(
                     "SELECT id, api_key, sort_order, manually_disabled
+                     , test_model, test_protocol
                      FROM pool_api_keys
                      WHERE base_url_id = ?1
                      ORDER BY sort_order ASC, id ASC",
@@ -1027,12 +1099,15 @@ fn load_pools(path: &PathBuf) -> Result<Vec<PoolConfig>, String> {
                 .map_err(|err| format!("Failed to prepare api_key query: {err}"))?;
             let key_rows = key_stmt
                 .query_map(params![base_url_id], |row| {
+                    let test_protocol_raw: String = row.get(5)?;
                     Ok(ApiKeyConfig {
                         id: row.get(0)?,
                         base_url_id,
                         api_key: row.get(1)?,
                         sort_order: row.get(2)?,
                         manually_disabled: row.get::<_, i64>(3)? != 0,
+                        test_model: row.get(4)?,
+                        test_protocol: TestProtocol::from_saved(&test_protocol_raw),
                     })
                 })
                 .map_err(|err| format!("Failed to query api_keys: {err}"))?;
@@ -1165,7 +1240,11 @@ fn json_id_ok(id: i64) -> Response<Body> {
     Json(IdResponse { ok: true, id }).into_response()
 }
 
-fn json_key_test_ok(message: impl Into<String>, status_code: Option<u16>, ok: bool) -> Response<Body> {
+fn json_key_test_ok(
+    message: impl Into<String>,
+    status_code: Option<u16>,
+    ok: bool,
+) -> Response<Body> {
     Json(KeyTestResponse {
         ok,
         message: message.into(),
@@ -1182,6 +1261,76 @@ fn json_error(status: StatusCode, message: impl Into<String>) -> Response<Body> 
         }),
     )
         .into_response()
+}
+
+#[derive(Clone, Debug)]
+struct KeyTestTarget {
+    api_key: String,
+    base_url: String,
+    supplier_protocol: ProtocolMode,
+    selected_model: Option<String>,
+    selected_protocol: Option<TestProtocol>,
+}
+
+fn normalize_test_model(value: &str) -> Result<String, String> {
+    let model = value.trim();
+    if model.is_empty() {
+        return Err("model is required".to_string());
+    }
+    Ok(model.to_string())
+}
+
+fn resolve_test_protocol(
+    supplier_protocol: &ProtocolMode,
+    requested: Option<TestProtocol>,
+) -> Result<TestProtocol, String> {
+    match supplier_protocol {
+        ProtocolMode::Chat => match requested {
+            Some(TestProtocol::Responses) => Err("supplier protocol only allows chat".to_string()),
+            _ => Ok(TestProtocol::Chat),
+        },
+        ProtocolMode::Responses => match requested {
+            Some(TestProtocol::Chat) => Err("supplier protocol only allows responses".to_string()),
+            _ => Ok(TestProtocol::Responses),
+        },
+        ProtocolMode::Both => requested.ok_or_else(|| "protocol is required".to_string()),
+    }
+}
+
+fn key_test_target(conn: &Connection, id: i64) -> Result<Option<KeyTestTarget>, String> {
+    conn.query_row(
+        "SELECT k.api_key, b.base_url, b.protocol_mode, k.test_model, k.test_protocol
+         FROM pool_api_keys k
+         JOIN pool_base_urls b ON b.id = k.base_url_id
+         WHERE k.id = ?1",
+        params![id],
+        |row| {
+            let supplier_protocol_raw: String = row.get(2)?;
+            let test_model: String = row.get(3)?;
+            let test_protocol_raw: String = row.get(4)?;
+            let supplier_protocol =
+                ProtocolMode::from_str(&supplier_protocol_raw).map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        Box::new(io::Error::new(io::ErrorKind::InvalidData, err)),
+                    )
+                })?;
+            Ok(KeyTestTarget {
+                api_key: row.get(0)?,
+                base_url: row.get(1)?,
+                supplier_protocol,
+                selected_model: if test_model.trim().is_empty() {
+                    None
+                } else {
+                    Some(test_model)
+                },
+                selected_protocol: TestProtocol::from_saved(&test_protocol_raw),
+            })
+        },
+    )
+    .optional()
+    .map_err(|err| format!("Failed to load api_key: {err}"))
 }
 
 fn should_skip_header(name: &str, skipped: &[&str]) -> bool {
@@ -2024,7 +2173,8 @@ async fn record_key_usage(
 async fn clear_access_key_usage(state: &AppState, access_key_id: i64) {
     let mut usage = state.usage.write().await;
     usage.by_access_key.remove(&access_key_id);
-    usage.by_key
+    usage
+        .by_key
         .retain(|_, item| item.access_key_id != access_key_id);
 }
 
@@ -2041,15 +2191,19 @@ where
     for access_key_id in &access_key_ids {
         usage.by_access_key.remove(access_key_id);
     }
-    usage.by_key
+    usage
+        .by_key
         .retain(|_, item| !access_key_ids.contains(&item.access_key_id));
 }
 
 async fn clear_supplier_usage(state: &AppState, supplier_id: i64) {
     let mut usage = state.usage.write().await;
-    usage.by_access_key
+    usage
+        .by_access_key
         .retain(|_, item| item.supplier_id != supplier_id);
-    usage.by_key.retain(|_, item| item.supplier_id != supplier_id);
+    usage
+        .by_key
+        .retain(|_, item| item.supplier_id != supplier_id);
 }
 
 async fn reconcile_usage_runtime(state: &AppState) {
@@ -2133,10 +2287,12 @@ async fn pools_response(state: &AppState) -> ProxiesResponse {
     let mut runtime = state.runtime.write().await;
     ensure_runtime_day(&mut runtime, now);
 
-    let binding_counts = access_keys.iter().fold(HashMap::new(), |mut map, access_key| {
-        *map.entry(access_key.proxy_id).or_insert(0usize) += 1;
-        map
-    });
+    let binding_counts = access_keys
+        .iter()
+        .fold(HashMap::new(), |mut map, access_key| {
+            *map.entry(access_key.proxy_id).or_insert(0usize) += 1;
+            map
+        });
     let access_key_names: HashMap<i64, String> = access_keys
         .iter()
         .map(|item| (item.id, item.name.clone()))
@@ -2171,6 +2327,12 @@ async fn pools_response(state: &AppState) -> ProxiesResponse {
                                 masked_key: mask_key(&key.api_key),
                                 sort_order: key.sort_order,
                                 manually_disabled: key.manually_disabled,
+                                test_model: if key.test_model.is_empty() {
+                                    None
+                                } else {
+                                    Some(key.test_model.clone())
+                                },
+                                test_protocol: key.test_protocol,
                                 fail_count: availability.fail_count,
                                 banned: availability.banned,
                                 ban_until: availability.ban_until,
@@ -2299,7 +2461,10 @@ async fn access_keys_response(state: &AppState) -> AccessKeysResponse {
         })
         .collect();
 
-    AccessKeysResponse { access_keys, proxies }
+    AccessKeysResponse {
+        access_keys,
+        proxies,
+    }
 }
 
 async fn get_access_keys(State(state): State<AppState>) -> Json<AccessKeysResponse> {
@@ -2533,8 +2698,11 @@ async fn save_proxy_draft(
                             runtime_ids_to_clear.insert(*key_id);
                         }
                     }
-                    tx.execute("DELETE FROM pool_base_urls WHERE id = ?1", params![supplier_id])
-                        .map_err(|err| format!("Failed to delete supplier: {err}"))?;
+                    tx.execute(
+                        "DELETE FROM pool_base_urls WHERE id = ?1",
+                        params![supplier_id],
+                    )
+                    .map_err(|err| format!("Failed to delete supplier: {err}"))?;
                 }
             }
 
@@ -2952,9 +3120,7 @@ async fn create_base_url(
     }
 
     match duplicate_base_url_exists(&conn, pool_id, &base_url, None) {
-        Ok(true) => {
-            return json_error(StatusCode::BAD_REQUEST, "base_url already exists in proxy")
-        }
+        Ok(true) => return json_error(StatusCode::BAD_REQUEST, "base_url already exists in proxy"),
         Ok(false) => {}
         Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
@@ -3025,9 +3191,7 @@ async fn update_base_url(
     };
 
     match duplicate_base_url_exists(&conn, pool_id, &base_url, Some(id)) {
-        Ok(true) => {
-            return json_error(StatusCode::BAD_REQUEST, "base_url already exists in proxy")
-        }
+        Ok(true) => return json_error(StatusCode::BAD_REQUEST, "base_url already exists in proxy"),
         Ok(false) => {}
         Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
@@ -3354,36 +3518,53 @@ async fn unban_key(State(state): State<AppState>, Path(id): Path<i64>) -> Respon
     json_ok()
 }
 
-async fn test_key(State(state): State<AppState>, Path(id): Path<i64>) -> Response<Body> {
+fn parse_model_ids(body: &[u8]) -> Result<Vec<String>, String> {
+    let value: Value = serde_json::from_slice(body)
+        .map_err(|err| format!("invalid models response JSON: {err}"))?;
+    let data = value
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "models response missing data".to_string())?;
+    let mut models = Vec::new();
+    let mut seen = HashSet::new();
+    for item in data {
+        let Some(model) = item.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if seen.insert(model.to_string()) {
+            models.push(model.to_string());
+        }
+    }
+    Ok(models)
+}
+
+fn test_request_body(protocol: TestProtocol, model: &str) -> Result<Vec<u8>, String> {
+    let body = match protocol {
+        TestProtocol::Chat => json!({
+            "model": model,
+            "messages": [{ "role": "user", "content": "hi" }]
+        }),
+        TestProtocol::Responses => json!({
+            "model": model,
+            "input": "hi"
+        }),
+    };
+    serde_json::to_vec(&body).map_err(|err| format!("failed to encode test request: {err}"))
+}
+
+async fn key_models(State(state): State<AppState>, Path(id): Path<i64>) -> Response<Body> {
     let conn = match open_db(&state.db_path) {
         Ok(conn) => conn,
         Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
 
-    let record: Option<(String, String)> = match conn
-        .query_row(
-            "SELECT k.api_key, b.base_url
-             FROM pool_api_keys k
-             JOIN pool_base_urls b ON b.id = k.base_url_id
-             WHERE k.id = ?1",
-            params![id],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-        )
-        .optional()
-    {
-        Ok(value) => value,
-        Err(err) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to load api_key: {err}"),
-            )
-        }
-    };
-    let Some((api_key, base_url)) = record else {
-        return json_error(StatusCode::NOT_FOUND, "api_key not found");
+    let target = match key_test_target(&conn, id) {
+        Ok(Some(target)) => target,
+        Ok(None) => return json_error(StatusCode::NOT_FOUND, "api_key not found"),
+        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
 
-    let upstream_url = match build_upstream_url(&base_url, MODELS_PATH, None) {
+    let upstream_url = match build_upstream_url(&target.base_url, MODELS_PATH, None) {
         Ok(url) => url,
         Err(err) => return json_error(StatusCode::BAD_REQUEST, err),
     };
@@ -3391,15 +3572,108 @@ async fn test_key(State(state): State<AppState>, Path(id): Path<i64>) -> Respons
         Ok(authority) => authority,
         Err(err) => return json_error(StatusCode::BAD_GATEWAY, err),
     };
-    let headers = match build_upstream_headers(&HeaderMap::new(), &authority, &api_key) {
+    let headers = match build_upstream_headers(&HeaderMap::new(), &authority, &target.api_key) {
         Ok(headers) => headers,
         Err(err) => return json_error(StatusCode::BAD_GATEWAY, err),
     };
 
+    match state.client.get(upstream_url).headers(headers).send().await {
+        Ok(response) if response.status().is_success() => {
+            let body = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    return json_error(
+                        StatusCode::BAD_GATEWAY,
+                        format!("Failed to read upstream models response: {err}"),
+                    )
+                }
+            };
+            let models = match parse_model_ids(&body) {
+                Ok(models) => models,
+                Err(err) => return json_error(StatusCode::BAD_GATEWAY, err),
+            };
+            Json(KeyModelsResponse {
+                models,
+                selected_model: target.selected_model,
+                selected_protocol: target.selected_protocol,
+                supplier_protocol: target.supplier_protocol,
+            })
+            .into_response()
+        }
+        Ok(response) => json_error(
+            StatusCode::BAD_GATEWAY,
+            format!("Failed to load models ({})", response.status().as_u16()),
+        ),
+        Err(err) if err.is_timeout() => json_error(StatusCode::BAD_GATEWAY, "加载模型超时"),
+        Err(err) => json_error(StatusCode::BAD_GATEWAY, format!("加载模型失败: {err}")),
+    }
+}
+
+async fn test_key(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Json(payload): Json<KeyTestRequest>,
+) -> Response<Body> {
+    let model = match normalize_test_model(&payload.model) {
+        Ok(model) => model,
+        Err(err) => return json_error(StatusCode::BAD_REQUEST, err),
+    };
+
+    let conn = match open_db(&state.db_path) {
+        Ok(conn) => conn,
+        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+
+    let Some(target) = (match key_test_target(&conn, id) {
+        Ok(target) => target,
+        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    }) else {
+        return json_error(StatusCode::NOT_FOUND, "api_key not found");
+    };
+
+    let protocol = match resolve_test_protocol(&target.supplier_protocol, payload.protocol) {
+        Ok(protocol) => protocol,
+        Err(err) => return json_error(StatusCode::BAD_REQUEST, err),
+    };
+
+    if let Err(err) = conn.execute(
+        "UPDATE pool_api_keys
+         SET test_model = ?1, test_protocol = ?2, updated_at = strftime('%s', 'now')
+         WHERE id = ?3",
+        params![&model, protocol.as_str(), id],
+    ) {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to save test settings: {err}"),
+        );
+    }
+    if let Err(err) = reload_pools(&state).await {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
+    }
+
+    let upstream_url = match build_upstream_url(&target.base_url, protocol.endpoint().path(), None)
+    {
+        Ok(url) => url,
+        Err(err) => return json_error(StatusCode::BAD_REQUEST, err),
+    };
+    let authority = match upstream_authority(&upstream_url) {
+        Ok(authority) => authority,
+        Err(err) => return json_error(StatusCode::BAD_GATEWAY, err),
+    };
+    let headers = match build_upstream_headers(&HeaderMap::new(), &authority, &target.api_key) {
+        Ok(headers) => headers,
+        Err(err) => return json_error(StatusCode::BAD_GATEWAY, err),
+    };
+    let body = match test_request_body(protocol, &model) {
+        Ok(body) => body,
+        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+
     match state
         .client
-        .get(upstream_url)
+        .post(upstream_url)
         .headers(headers)
+        .body(body)
         .send()
         .await
     {
@@ -3459,7 +3733,10 @@ async fn proxy_for_access_key(
 
     let pool = {
         let pools = state.pools.read().await;
-        pools.iter().find(|pool| pool.id == access_key.proxy_id).cloned()
+        pools
+            .iter()
+            .find(|pool| pool.id == access_key.proxy_id)
+            .cloned()
     }
     .ok_or_else(|| {
         json_error(
@@ -3500,7 +3777,12 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
     let mut last_error: Option<ProxyAttemptError> = None;
     let allow_auto_ban = !pool_has_single_supplier_and_key(&pool);
     let request_body_preview = if path == RESPONSES_PATH {
-        Some(String::from_utf8_lossy(&buffered_body).chars().take(800).collect::<String>())
+        Some(
+            String::from_utf8_lossy(&buffered_body)
+                .chars()
+                .take(800)
+                .collect::<String>(),
+        )
     } else {
         None
     };
@@ -3544,13 +3826,7 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
 
                 info!(
                     "{} {} -> access_key={} proxy={} supplier_id={} key_id={} {}",
-                    parts.method,
-                    path,
-                    access_key.id,
-                    pool.id,
-                    base_url.id,
-                    key.id,
-                    upstream_path
+                    parts.method, path, access_key.id, pool.id, base_url.id, key.id, upstream_path
                 );
                 if path == RESPONSES_PATH {
                     info!(
@@ -3764,7 +4040,10 @@ async fn main() {
         .route("/admin/keys", get(access_keys_page))
         .route("/admin/api/proxies", get(get_proxies).post(create_pool))
         .route("/admin/api/proxies/save", post(create_proxy_save))
-        .route("/admin/api/access-keys", get(get_access_keys).post(create_access_key))
+        .route(
+            "/admin/api/access-keys",
+            get(get_access_keys).post(create_access_key),
+        )
         .route(
             "/admin/api/access-keys/{id}",
             put(update_access_key).delete(delete_access_key),
@@ -3798,6 +4077,7 @@ async fn main() {
         .route("/admin/api/keys/{id}", put(update_key).delete(delete_key))
         .route("/admin/api/keys/{id}/disable", post(disable_key))
         .route("/admin/api/keys/{id}/enable", post(enable_key))
+        .route("/admin/api/keys/{id}/models", get(key_models))
         .route("/admin/api/keys/{id}/test", post(test_key))
         .route("/admin/api/keys/{id}/unban", post(unban_key))
         .layer(middleware::from_fn_with_state(state.clone(), admin_auth));
@@ -3986,6 +4266,8 @@ mod tests {
             api_key: "sk-test".to_string(),
             sort_order: 0,
             manually_disabled: false,
+            test_model: String::new(),
+            test_protocol: None,
         };
         let now = fixed_now();
         let mut state = KeyRuntimeState::default();
@@ -4023,6 +4305,8 @@ mod tests {
             api_key: "sk-test".to_string(),
             sort_order: 0,
             manually_disabled: false,
+            test_model: String::new(),
+            test_protocol: None,
         };
         let now = fixed_now();
         let mut state = KeyRuntimeState::default();
@@ -4058,6 +4342,8 @@ mod tests {
             api_key: "sk-test".to_string(),
             sort_order: 0,
             manually_disabled: true,
+            test_model: String::new(),
+            test_protocol: None,
         };
         let mut state = KeyRuntimeState::default();
         let availability = key_availability_in_state(&key, &mut state, fixed_now());
@@ -4090,7 +4376,11 @@ mod tests {
             conn.execute(
                 "INSERT INTO access_keys (name, access_key, proxy_id, created_at, updated_at)
                  VALUES (?1, ?2, ?3, strftime('%s', 'now'), strftime('%s', 'now'))",
-                params!["客户端 A", "me-1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd", pool_id],
+                params![
+                    "客户端 A",
+                    "me-1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd",
+                    pool_id
+                ],
             )
             .unwrap();
         }
@@ -4100,6 +4390,80 @@ mod tests {
         assert_eq!(access_keys[0].name, "客户端 A");
         assert_eq!(access_keys[0].proxy_id, 1);
         assert!(access_keys[0].access_key.starts_with("me-"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn init_database_adds_key_test_columns_and_loads_saved_values() {
+        let path = temp_db_path("key-test-columns");
+
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "
+                CREATE TABLE pools (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    note TEXT NOT NULL DEFAULT '',
+                    is_active INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+                );
+                CREATE TABLE pool_base_urls (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pool_id INTEGER NOT NULL,
+                    name TEXT NOT NULL DEFAULT '',
+                    base_url TEXT NOT NULL,
+                    protocol_mode TEXT NOT NULL DEFAULT 'both',
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+                );
+                CREATE TABLE pool_api_keys (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    base_url_id INTEGER NOT NULL,
+                    api_key TEXT NOT NULL,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    manually_disabled INTEGER NOT NULL DEFAULT 0,
+                    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+                );
+                CREATE TABLE access_keys (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    access_key TEXT NOT NULL UNIQUE,
+                    proxy_id INTEGER NOT NULL,
+                    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+                    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
+                );
+                INSERT INTO pools (name, note, is_active) VALUES ('测试代理', '', 0);
+                INSERT INTO pool_base_urls (pool_id, name, base_url, protocol_mode, sort_order)
+                VALUES (1, '供应商 A', 'https://api.example.com/v1', 'both', 0);
+                INSERT INTO pool_api_keys (base_url_id, api_key, sort_order, manually_disabled)
+                VALUES (1, 'sk-test-123', 0, 0);
+                ",
+            )
+            .unwrap();
+        }
+
+        init_database(&path).unwrap();
+
+        {
+            let conn = open_db(&path).unwrap();
+            conn.execute(
+                "UPDATE pool_api_keys
+                 SET test_model = ?1, test_protocol = ?2
+                 WHERE id = 1",
+                params!["gpt-test", "responses"],
+            )
+            .unwrap();
+        }
+
+        let pools = load_pools(&path).unwrap();
+        let key = &pools[0].base_urls[0].api_keys[0];
+        assert_eq!(key.test_model, "gpt-test");
+        assert_eq!(key.test_protocol, Some(TestProtocol::Responses));
 
         let _ = fs::remove_file(path);
     }
@@ -4199,7 +4563,9 @@ mod tests {
         let access_keys = access_keys_response(&state).await;
         assert_eq!(access_keys.access_keys.len(), 1);
         assert_eq!(
-            access_keys.access_keys[0].last_used_supplier_name.as_deref(),
+            access_keys.access_keys[0]
+                .last_used_supplier_name
+                .as_deref(),
             Some("OpenAI")
         );
         assert_eq!(
@@ -4217,6 +4583,45 @@ mod tests {
             Some("客户端 A")
         );
         assert!(proxies.proxies[0].suppliers[0].keys[0].last_used);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn pools_response_includes_saved_test_preferences() {
+        let path = temp_db_path("pool-test-preferences");
+        init_database(&path).unwrap();
+
+        {
+            let conn = open_db(&path).unwrap();
+            conn.execute(
+                "INSERT INTO pools (name, note, is_active, created_at, updated_at)
+                 VALUES ('测试代理', '', 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                [],
+            )
+            .unwrap();
+            let pool_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO pool_base_urls (pool_id, name, base_url, protocol_mode, sort_order, created_at, updated_at)
+                 VALUES (?1, '供应商 A', 'https://api.example.com/v1', 'both', 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![pool_id],
+            )
+            .unwrap();
+            let supplier_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO pool_api_keys
+                 (base_url_id, api_key, sort_order, manually_disabled, test_model, test_protocol, created_at, updated_at)
+                 VALUES (?1, 'sk-test-1234567890', 0, 0, 'gpt-4.1-mini', 'chat', strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![supplier_id],
+            )
+            .unwrap();
+        }
+
+        let state = test_app_state(&path);
+        let proxies = pools_response(&state).await;
+        let key = &proxies.proxies[0].suppliers[0].keys[0];
+        assert_eq!(key.test_model.as_deref(), Some("gpt-4.1-mini"));
+        assert_eq!(key.test_protocol, Some(TestProtocol::Chat));
 
         let _ = fs::remove_file(path);
     }
