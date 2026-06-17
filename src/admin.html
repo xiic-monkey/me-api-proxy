@@ -1005,6 +1005,7 @@
     const editorSub = document.getElementById('editorSub');
     const backToEmpty = document.getElementById('backToEmpty');
     const testModalRoot = document.getElementById('testModalRoot');
+    let testModalUiState = null;
 
     function nextLocalId(prefix) {
       const id = `${prefix}-${state.nextLocalId}`;
@@ -1046,6 +1047,10 @@
     }
 
     function isBaseExpanded(baseLocalId) {
+      const pool = currentEditablePool();
+      if (pool?.baseUrls.length === 1 && pool.baseUrls[0]?.localId === baseLocalId) {
+        return true;
+      }
       return state.expandedBaseLocalIds.has(baseLocalId);
     }
 
@@ -1058,8 +1063,32 @@
     }
 
     function toggleBaseExpanded(baseLocalId) {
+      const pool = currentEditablePool();
+      if (pool?.baseUrls.length === 1 && pool.baseUrls[0]?.localId === baseLocalId) {
+        return;
+      }
       setBaseExpanded(baseLocalId, !isBaseExpanded(baseLocalId));
       render();
+    }
+
+    function reconcileExpandedBaseState() {
+      const pool = currentEditablePool();
+      if (!pool) {
+        state.expandedBaseLocalIds = new Set();
+        return;
+      }
+
+      const nextExpanded = new Set(
+        pool.baseUrls
+          .map(base => base.localId)
+          .filter(baseLocalId => state.expandedBaseLocalIds.has(baseLocalId))
+      );
+
+      if (pool.baseUrls.length === 1) {
+        nextExpanded.add(pool.baseUrls[0].localId);
+      }
+
+      state.expandedBaseLocalIds = nextExpanded;
     }
 
     function resetSupplierUiState() {
@@ -1147,7 +1176,10 @@
       state.errorMessage = '';
       state.keyTestState = {};
       closeTestModal();
-      resetSupplierUiState();
+      state.draggingBaseLocalId = null;
+      state.dragOverBaseLocalId = null;
+      state.dragOverPosition = null;
+      reconcileExpandedBaseState();
     }
 
     function markDirty() {
@@ -1295,6 +1327,78 @@
       return state.testModal.models.filter(item => item.value.toLowerCase().includes(filter));
     }
 
+    function captureTestModalUiState() {
+      if (!state.testModal.open || !testModalRoot.childElementCount) {
+        return null;
+      }
+
+      const modelList = testModalRoot.querySelector('.model-list');
+      const active = document.activeElement;
+      const uiState = {
+        focusTarget: '',
+        focusValue: '',
+        selectionStart: null,
+        selectionEnd: null,
+        modelListScrollTop: modelList ? modelList.scrollTop : 0
+      };
+
+      if (!(active instanceof HTMLElement) || !testModalRoot.contains(active)) {
+        return uiState;
+      }
+
+      const inputType = active.dataset?.input;
+      if (inputType === 'test-model-filter' && active instanceof HTMLInputElement) {
+        uiState.focusTarget = inputType;
+        uiState.selectionStart = active.selectionStart;
+        uiState.selectionEnd = active.selectionEnd;
+        return uiState;
+      }
+
+      if ((inputType === 'test-model' || inputType === 'test-protocol') && active instanceof HTMLInputElement) {
+        uiState.focusTarget = inputType;
+        uiState.focusValue = active.value;
+      }
+
+      return uiState;
+    }
+
+    function restoreTestModalUiState(uiState) {
+      if (!uiState || !state.testModal.open) {
+        return;
+      }
+
+      requestAnimationFrame(() => {
+        if (!state.testModal.open) {
+          return;
+        }
+
+        let focusTarget = null;
+        if (uiState.focusTarget === 'test-model-filter') {
+          focusTarget = testModalRoot.querySelector('[data-input="test-model-filter"]');
+        } else if (uiState.focusTarget === 'test-model' || uiState.focusTarget === 'test-protocol') {
+          focusTarget = testModalRoot.querySelector(
+            `[data-input="${uiState.focusTarget}"][value="${CSS.escape(uiState.focusValue)}"]`
+          );
+        }
+
+        if (focusTarget instanceof HTMLInputElement) {
+          focusTarget.focus({ preventScroll: true });
+          if (
+            uiState.focusTarget === 'test-model-filter'
+            && uiState.selectionStart != null
+            && uiState.selectionEnd != null
+          ) {
+            focusTarget.setSelectionRange(uiState.selectionStart, uiState.selectionEnd);
+          }
+        }
+
+        const modelList = testModalRoot.querySelector('.model-list');
+        if (modelList) {
+          modelList.scrollTop = uiState.modelListScrollTop;
+        }
+      });
+    }
+
     function openTestModalSkeleton(key, base) {
       state.testModal = {
         open: true,
@@ -1329,6 +1433,7 @@
         selectedProtocol: '',
         supplierProtocol: 'chat'
       };
+      testModalUiState = null;
     }
 
     function baseTitle(base) {
@@ -1797,6 +1902,7 @@
         return;
       }
 
+      const uiState = captureTestModalUiState();
       const visibleModels = modalModelOptions();
       const showProtocol = state.testModal.supplierProtocol === 'both';
       const canSubmit = state.testModal.loadState === 'ready'
@@ -1874,6 +1980,8 @@
           </div>
         </div>
       `;
+      testModalUiState = uiState;
+      restoreTestModalUiState(testModalUiState);
     }
 
     function renderPoolList() {
@@ -2023,6 +2131,7 @@
 
     function renderBaseCard(pool, base) {
       const expanded = isBaseExpanded(base.localId);
+      const singleBaseAlwaysOpen = pool.baseUrls.length === 1;
       const dragging = state.draggingBaseLocalId === base.localId;
       const dragOverPosition = state.dragOverBaseLocalId === base.localId ? state.dragOverPosition : null;
       const cardClasses = [
@@ -2055,7 +2164,7 @@
               </div>
             </div>
             <div class="base-card-actions">
-              <button class="button light" data-action="toggle-base" data-base-local-id="${base.localId}">${expanded ? '收起' : '展开'}</button>
+              ${singleBaseAlwaysOpen ? '' : `<button class="button light" data-action="toggle-base" data-base-local-id="${base.localId}">${expanded ? '收起' : '展开'}</button>`}
               <button class="button light" data-action="add-key" data-local-id="${pool.localId}" data-base-local-id="${base.localId}">+ 新增 Key</button>
               <button class="button danger" data-action="remove-base-url" data-local-id="${pool.localId}" data-base-local-id="${base.localId}">删除</button>
             </div>
