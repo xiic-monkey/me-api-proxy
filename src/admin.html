@@ -80,7 +80,7 @@
       min-height: 0;
       min-width: 0;
       overflow: auto;
-      padding: 18px 20px 20px;
+      padding: 12px 20px 16px;
     }
 
     h1,
@@ -226,8 +226,8 @@
 
     .pool-card {
       display: grid;
-      gap: 14px;
-      padding: 16px;
+      gap: 10px;
+      padding: 14px;
       border: 1px solid var(--line);
       border-radius: 16px;
       background: #fff;
@@ -240,6 +240,21 @@
       border-color: #b8d4ff;
       background: linear-gradient(180deg, #ffffff 0%, #f8fbff 100%);
       box-shadow: 0 10px 28px rgba(37, 99, 235, 0.08);
+    }
+
+    .pool-card.dragging {
+      opacity: 0.55;
+      box-shadow: 0 12px 28px rgba(16, 24, 40, 0.1);
+    }
+
+    .pool-card.drag-over-before {
+      border-top-color: var(--blue);
+      box-shadow: 0 -3px 0 var(--blue);
+    }
+
+    .pool-card.drag-over-after {
+      border-bottom-color: var(--blue);
+      box-shadow: 0 3px 0 var(--blue);
     }
 
     .pool-head,
@@ -311,7 +326,7 @@
 
     .editor-placeholder,
     .editor-view {
-      min-height: 720px;
+      min-height: 0;
     }
 
     .editor-placeholder {
@@ -358,6 +373,24 @@
 
     .summary-main h3 {
       overflow-wrap: anywhere;
+    }
+
+    .summary-name-input {
+      font-size: 16px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      padding: 6px 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      color: var(--text);
+      outline: none;
+      transition: border-color 0.16s ease, box-shadow 0.16s ease;
+    }
+
+    .summary-name-input:focus {
+      border-color: #9ec5ff;
+      box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.08);
     }
 
     .summary-side {
@@ -470,15 +503,15 @@
       align-items: center;
       justify-content: space-between;
       gap: 12px;
-      padding: 16px;
+      padding: 10px 16px;
       border-bottom: 1px solid var(--line);
       background: #fcfcfd;
     }
 
     .section-body {
-      padding: 16px;
+      padding: 10px 16px 12px;
       display: grid;
-      gap: 12px;
+      gap: 10px;
       min-width: 0;
     }
 
@@ -496,6 +529,23 @@
       display: grid;
       gap: 6px;
       min-width: 0;
+    }
+
+    .model-override-row {
+      display: flex;
+      gap: 4px;
+      align-items: stretch;
+    }
+
+    .model-override-row input {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .icon-btn {
+      flex: 0 0 auto;
+      padding: 10px;
+      line-height: 1;
     }
 
     .field label {
@@ -565,7 +615,7 @@
       align-items: center;
       justify-content: space-between;
       gap: 10px;
-      padding: 14px 14px 12px;
+      padding: 10px 12px;
       border-bottom: 1px solid var(--line);
       min-width: 0;
     }
@@ -650,9 +700,9 @@
     }
 
     .base-card-body {
-      padding: 14px;
+      padding: 10px 12px;
       display: grid;
-      gap: 12px;
+      gap: 10px;
       min-width: 0;
     }
 
@@ -926,6 +976,72 @@
         flex-direction: column;
       }
     }
+
+    .toast-container {
+      position: fixed;
+      top: 24px;
+      right: 24px;
+      z-index: 100;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      pointer-events: none;
+    }
+
+    .toast {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 12px 18px;
+      border-radius: 12px;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      box-shadow: 0 12px 32px rgba(16, 24, 40, 0.14);
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      pointer-events: auto;
+      animation: toast-in 0.25s ease;
+      max-width: 360px;
+    }
+
+    .toast.fade-out {
+      animation: toast-out 0.25s ease forwards;
+    }
+
+    .toast.success {
+      color: var(--green);
+      border-color: #bbf7d0;
+      background: var(--green-soft);
+    }
+
+    .toast.error {
+      color: var(--red);
+      border-color: #fecaca;
+      background: var(--red-soft);
+    }
+
+    @keyframes toast-in {
+      from {
+        opacity: 0;
+        transform: translateX(24px);
+      }
+      to {
+        opacity: 1;
+        transform: translateX(0);
+      }
+    }
+
+    @keyframes toast-out {
+      from {
+        opacity: 1;
+        transform: translateX(0);
+      }
+      to {
+        opacity: 0;
+        transform: translateX(24px);
+      }
+    }
   </style>
 </head>
 <body>
@@ -966,6 +1082,7 @@
   </div>
 
   <div class="modal-root" id="testModalRoot" aria-hidden="true"></div>
+  <div class="toast-container" id="toastContainer"></div>
 
   <script>
     const state = {
@@ -996,6 +1113,9 @@
       draggingBaseLocalId: null,
       dragOverBaseLocalId: null,
       dragOverPosition: null,
+      draggingPoolLocalId: null,
+      dragOverPoolLocalId: null,
+      dragOverPoolPosition: null,
       nextLocalId: 1
     };
 
@@ -1005,6 +1125,7 @@
     const editorSub = document.getElementById('editorSub');
     const backToEmpty = document.getElementById('backToEmpty');
     const testModalRoot = document.getElementById('testModalRoot');
+    const toastContainer = document.getElementById('toastContainer');
     let testModalUiState = null;
 
     function nextLocalId(prefix) {
@@ -1015,6 +1136,18 @@
 
     function deepClone(value) {
       return JSON.parse(JSON.stringify(value));
+    }
+
+    function showToast(message, type = 'success') {
+      const toast = document.createElement('div');
+      toast.className = `toast ${type}`;
+      toast.textContent = message;
+      toastContainer.appendChild(toast);
+
+      setTimeout(() => {
+        toast.classList.add('fade-out');
+        toast.addEventListener('animationend', () => toast.remove());
+      }, 3000);
     }
 
     function protocolLabel(value) {
@@ -1047,10 +1180,6 @@
     }
 
     function isBaseExpanded(baseLocalId) {
-      const pool = currentEditablePool();
-      if (pool?.baseUrls.length === 1 && pool.baseUrls[0]?.localId === baseLocalId) {
-        return true;
-      }
       return state.expandedBaseLocalIds.has(baseLocalId);
     }
 
@@ -1063,10 +1192,6 @@
     }
 
     function toggleBaseExpanded(baseLocalId) {
-      const pool = currentEditablePool();
-      if (pool?.baseUrls.length === 1 && pool.baseUrls[0]?.localId === baseLocalId) {
-        return;
-      }
       setBaseExpanded(baseLocalId, !isBaseExpanded(baseLocalId));
       render();
     }
@@ -1083,10 +1208,6 @@
           .map(base => base.localId)
           .filter(baseLocalId => state.expandedBaseLocalIds.has(baseLocalId))
       );
-
-      if (pool.baseUrls.length === 1) {
-        nextExpanded.add(pool.baseUrls[0].localId);
-      }
 
       state.expandedBaseLocalIds = nextExpanded;
     }
@@ -1230,6 +1351,8 @@
         label: supplier.name || '',
         protocol: supplier.protocol,
         url: supplier.base_url,
+        overrideModel: supplier.override_model || '',
+        overrideModels: [],
         lastUsedAt: supplier.last_used_at || null,
         lastUsedByAccessKeyName: supplier.last_used_by_access_key_name || '',
         keys: supplier.keys.map(mapKeyFromApi)
@@ -1589,6 +1712,8 @@
         label: '',
         protocol: 'both',
         url: '',
+        overrideModel: '',
+        overrideModels: [],
         keys: []
       };
       pool.baseUrls.push(base);
@@ -1692,6 +1817,7 @@
           name: (base.label || '').trim(),
           base_url: base.url.trim().replace(/\/+$/, ''),
           protocol: base.protocol,
+          override_model: (base.overrideModel || '').trim(),
           keys: base.keys.map(key => ({
             ...(key.id ? { id: key.id } : {}),
             api_key: key.value.trim()
@@ -1708,6 +1834,7 @@
       if (validationError) {
         state.saveState = 'error';
         state.errorMessage = validationError;
+        showToast(validationError, 'error');
         render();
         return;
       }
@@ -1725,10 +1852,12 @@
         await loadProxies({ selectProxyId: result.id });
         state.saveState = 'saved';
         state.errorMessage = '';
+        showToast('保存成功', 'success');
         render();
       } catch (error) {
         state.saveState = 'error';
         state.errorMessage = error.message || '保存失败';
+        showToast(error.message || '保存失败', 'error');
         render();
       }
     }
@@ -1844,16 +1973,52 @@
       await loadTestModels();
     }
 
+    async function loadSupplierModels(baseLocalId) {
+      const pool = currentEditablePool();
+      if (!pool) return;
+      const base = pool.baseUrls.find(b => b.localId === baseLocalId);
+      if (!base) return;
+
+      const firstKeyWithId = base.keys.find(k => k.id);
+      if (!firstKeyWithId) {
+        alert('请先保存后再获取模型列表');
+        return;
+      }
+
+      const btn = document.querySelector(`[data-action="load-supplier-models"][data-base-local-id="${baseLocalId}"]`);
+      if (btn) {
+        btn.disabled = true;
+        btn.textContent = '...';
+      }
+
+      try {
+        const result = await apiRequest(`/admin/api/keys/${firstKeyWithId.id}/models`);
+        base.overrideModels = result.models || [];
+        render();
+      } catch (error) {
+        alert('获取模型列表失败: ' + (error.message || '未知错误'));
+      } finally {
+        if (btn) {
+          btn.disabled = false;
+          btn.innerHTML = '&#x21bb;';
+        }
+      }
+    }
+
     async function submitKeyTest() {
       if (!state.testModal.keyId || !state.testModal.selectedModel || state.testModal.submitState === 'saving') {
         return;
       }
 
+      const testKeyId = state.testModal.keyId;
+      const testKeyLocalId = state.testModal.keyLocalId;
+      const testModel = state.testModal.selectedModel;
+      const testProtocol = state.testModal.supplierProtocol === 'both' ? state.testModal.selectedProtocol : '';
       state.testModal.submitState = 'saving';
       state.testModal.submitError = '';
       const key = currentEditablePool()
         ?.baseUrls.flatMap(base => base.keys)
-        .find(item => item.localId === state.testModal.keyLocalId || item.id === state.testModal.keyId);
+        .find(item => item.localId === testKeyLocalId || item.id === testKeyId);
       if (key) {
         state.keyTestState[keyTestId(key)] = '测试中...';
       }
@@ -1861,34 +2026,33 @@
 
       try {
         const body = {
-          model: state.testModal.selectedModel,
-          ...(state.testModal.supplierProtocol === 'both'
-            ? { protocol: state.testModal.selectedProtocol }
-            : {})
+          model: testModel,
+          ...(testProtocol ? { protocol: testProtocol } : {})
         };
-        const result = await apiRequest(`/admin/api/keys/${state.testModal.keyId}/test`, {
+        const result = await apiRequest(`/admin/api/keys/${testKeyId}/test`, {
           method: 'POST',
           body
         });
 
         const currentId = currentPool()?.id || null;
         await loadProxies({ selectProxyId: currentId });
-        const refreshedKey = currentEditablePool()
-          ?.baseUrls.flatMap(base => base.keys)
-          .find(item => item.id === state.testModal.keyId);
-        if (refreshedKey) {
-          state.keyTestState[keyTestId(refreshedKey)] = result?.message || (result?.ok ? '测试成功' : '测试失败');
+        const msg = result?.message || (result?.ok ? '测试成功' : '测试失败');
+        state.keyTestState[`saved-${testKeyId}`] = msg;
+        showToast(msg, result?.ok ? 'success' : 'error');
+        if (state.testModal.open && state.testModal.keyId === testKeyId) {
+          closeTestModal();
         }
-        closeTestModal();
       } catch (error) {
+        const errMsg = error.message || '测试失败';
         state.testModal.submitState = 'idle';
-        state.testModal.submitError = error.message || '测试失败';
+        state.testModal.submitError = errMsg;
         const activeKey = currentEditablePool()
           ?.baseUrls.flatMap(base => base.keys)
-          .find(item => item.id === state.testModal.keyId);
+          .find(item => item.id === testKeyId);
         if (activeKey) {
           state.keyTestState[keyTestId(activeKey)] = '测试失败';
         }
+        showToast(errMsg, 'error');
       }
 
       render();
@@ -1973,7 +2137,7 @@
             ` : ''}
           </div>
           <div class="modal-foot">
-            <button class="button light" data-action="close-test-modal" ${state.testModal.submitState === 'saving' ? 'disabled' : ''}>取消</button>
+            <button class="button light" data-action="close-test-modal">取消</button>
             <button class="button primary" data-action="submit-key-test" ${canSubmit ? '' : 'disabled'}>
               ${state.testModal.submitState === 'saving' ? '测试中...' : '发送 hi 测试'}
             </button>
@@ -2003,9 +2167,17 @@
       poolList.innerHTML = state.pools.map(pool => {
         const baseUrlCount = pool.baseUrls.length;
         const keyCount = pool.baseUrls.reduce((sum, item) => sum + item.keys.length, 0);
+        const dragging = state.draggingPoolLocalId === pool.localId;
+        const dragOverPosition = state.dragOverPoolLocalId === pool.localId ? state.dragOverPoolPosition : null;
+        const cardClasses = [
+          'pool-card',
+          pool.localId === state.selectedPoolLocalId && state.mode === 'edit' ? 'selected' : '',
+          dragging ? 'dragging' : '',
+          dragOverPosition ? `drag-over-${dragOverPosition}` : ''
+        ].filter(Boolean).join(' ');
 
         return `
-          <article class="pool-card ${pool.localId === state.selectedPoolLocalId && state.mode === 'edit' ? 'selected' : ''}" data-action="edit" data-local-id="${pool.localId}">
+          <article class="${cardClasses}" data-pool-card data-action="edit" data-local-id="${pool.localId}" draggable="true">
             <div class="pool-head">
               <div style="min-width:0;">
                 <div class="pool-name">${escapeHtml(pool.name)}</div>
@@ -2067,7 +2239,12 @@
           <div class="editor-toolbar">
             <div class="summary-bar">
               <div class="summary-main">
-                <h3>${escapeHtml(pool.name)}</h3>
+                <input
+                  class="summary-name-input"
+                  value="${escapeAttr(pool.name)}"
+                  data-input="pool-name"
+                  placeholder="代理名称"
+                />
                 ${state.errorMessage ? `<div class="error-text">${escapeHtml(state.errorMessage)}</div>` : ''}
               </div>
               <div class="summary-side">
@@ -2087,25 +2264,6 @@
           </div>
 
           <div class="editor-sections">
-            <section class="section">
-              <div class="section-head">
-                <div>
-                  <h3>基本信息</h3>
-                </div>
-              </div>
-              <div class="section-body">
-                <div class="field-grid single">
-                  <div class="field">
-                    <label>代理名称</label>
-                    <input
-                      value="${escapeAttr(pool.name)}"
-                      data-input="pool-name"
-                    />
-                  </div>
-                </div>
-              </div>
-            </section>
-
             <section class="section">
               <div class="section-head">
                 <div>
@@ -2131,7 +2289,6 @@
 
     function renderBaseCard(pool, base) {
       const expanded = isBaseExpanded(base.localId);
-      const singleBaseAlwaysOpen = pool.baseUrls.length === 1;
       const dragging = state.draggingBaseLocalId === base.localId;
       const dragOverPosition = state.dragOverBaseLocalId === base.localId ? state.dragOverPosition : null;
       const cardClasses = [
@@ -2164,7 +2321,7 @@
               </div>
             </div>
             <div class="base-card-actions">
-              ${singleBaseAlwaysOpen ? '' : `<button class="button light" data-action="toggle-base" data-base-local-id="${base.localId}">${expanded ? '收起' : '展开'}</button>`}
+              <button class="button light" data-action="toggle-base" data-base-local-id="${base.localId}">${expanded ? '收起' : '展开'}</button>
               <button class="button light" data-action="add-key" data-local-id="${pool.localId}" data-base-local-id="${base.localId}">+ 新增 Key</button>
               <button class="button danger" data-action="remove-base-url" data-local-id="${pool.localId}" data-base-local-id="${base.localId}">删除</button>
             </div>
@@ -2182,16 +2339,29 @@
                 />
               </div>
               <div class="field">
-                <label>协议</label>
-                <select data-input="base-protocol" data-base-local-id="${base.localId}">
-                  <option value="both" ${base.protocol === 'both' ? 'selected' : ''}>Chat + Responses</option>
-                  <option value="chat" ${base.protocol === 'chat' ? 'selected' : ''}>Chat</option>
-                  <option value="responses" ${base.protocol === 'responses' ? 'selected' : ''}>Responses</option>
-                </select>
+                <label>强制模型</label>
+                <div class="model-override-row">
+                  <input
+                    list="supplier-models-${base.localId}"
+                    value="${escapeAttr(base.overrideModel || '')}"
+                    placeholder="可选"
+                    data-input="base-override-model"
+                    data-base-local-id="${base.localId}"
+                  />
+                  <datalist id="supplier-models-${base.localId}">
+                    ${(base.overrideModels || []).map(m => `<option value="${escapeAttr(m)}"></option>`).join('')}
+                  </datalist>
+                  <button
+                    class="button light icon-btn"
+                    title="获取模型列表"
+                    data-action="load-supplier-models"
+                    data-base-local-id="${base.localId}"
+                  >&#x21bb;</button>
+                </div>
               </div>
             </div>
 
-            <div class="field-grid single">
+            <div class="field-grid">
               <div class="field">
                 <label>Base URL</label>
                 <input
@@ -2200,6 +2370,14 @@
                   data-input="base-url"
                   data-base-local-id="${base.localId}"
                 />
+              </div>
+              <div class="field">
+                <label>协议</label>
+                <select data-input="base-protocol" data-base-local-id="${base.localId}">
+                  <option value="both" ${base.protocol === 'both' ? 'selected' : ''}>Chat + Responses</option>
+                  <option value="chat" ${base.protocol === 'chat' ? 'selected' : ''}>Chat</option>
+                  <option value="responses" ${base.protocol === 'responses' ? 'selected' : ''}>Responses</option>
+                </select>
               </div>
             </div>
 
@@ -2305,6 +2483,14 @@
         return;
       }
 
+      if (inputType === 'base-override-model') {
+        const base = findDraftBase(target.dataset.baseLocalId);
+        if (!base) return;
+        base.overrideModel = target.value;
+        markDirty();
+        return;
+      }
+
       if (inputType === 'key-value') {
         const key = findDraftKey(target.dataset.baseLocalId, target.dataset.keyLocalId);
         if (!key) return;
@@ -2393,6 +2579,11 @@
         return;
       }
 
+      if (action === 'load-supplier-models') {
+        loadSupplierModels(baseLocalId);
+        return;
+      }
+
       if (action === 'test-key') {
         const base = currentEditablePool()
           ?.baseUrls.find(item => item.keys.some(key => key.localId === keyLocalId || key.id === Number(keyId)));
@@ -2402,7 +2593,6 @@
       }
 
       if (action === 'close-test-modal') {
-        if (state.testModal.submitState === 'saving') return;
         closeTestModal();
         render();
         return;
@@ -2496,7 +2686,7 @@
 
     document.addEventListener('keydown', event => {
       if (event.key !== 'Escape') return;
-      if (!state.testModal.open || state.testModal.submitState === 'saving') return;
+      if (!state.testModal.open) return;
       closeTestModal();
       render();
     });

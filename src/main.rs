@@ -178,6 +178,7 @@ struct BaseUrlConfig {
     name: String,
     base_url: String,
     protocol_mode: ProtocolMode,
+    override_model: String,
     sort_order: i64,
     api_keys: Vec<ApiKeyConfig>,
 }
@@ -300,6 +301,8 @@ struct BaseUrlPayload {
     name: String,
     base_url: String,
     protocol: ProtocolMode,
+    #[serde(default)]
+    override_model: String,
     sort_order: Option<i64>,
 }
 
@@ -326,6 +329,8 @@ struct SupplierSavePayload {
     base_url: String,
     protocol: ProtocolMode,
     #[serde(default)]
+    override_model: String,
+    #[serde(default)]
     keys: Vec<ApiKeySavePayload>,
 }
 
@@ -348,6 +353,7 @@ struct PreparedSupplierSave {
     name: String,
     base_url: String,
     protocol: ProtocolMode,
+    override_model: String,
     keys: Vec<PreparedApiKeySave>,
 }
 
@@ -389,6 +395,7 @@ struct SupplierView {
     name: String,
     base_url: String,
     protocol: ProtocolMode,
+    override_model: String,
     sort_order: i64,
     available_key_count: usize,
     total_key_count: usize,
@@ -540,6 +547,7 @@ fn init_database(path: &PathBuf) -> Result<(), String> {
             name TEXT NOT NULL,
             note TEXT NOT NULL DEFAULT '',
             is_active INTEGER NOT NULL DEFAULT 0,
+            sort_order INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
             updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
         );
@@ -550,6 +558,7 @@ fn init_database(path: &PathBuf) -> Result<(), String> {
             name TEXT NOT NULL DEFAULT '',
             base_url TEXT NOT NULL,
             protocol_mode TEXT NOT NULL DEFAULT 'both',
+            override_model TEXT NOT NULL DEFAULT '',
             sort_order INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
             updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
@@ -590,6 +599,19 @@ fn init_database(path: &PathBuf) -> Result<(), String> {
         )
         .map_err(|err| format!("Failed to add proxy note column: {err}"))?;
     }
+    if !pool_columns.contains("sort_order") {
+        conn.execute(
+            "ALTER TABLE pools ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .map_err(|err| format!("Failed to add proxy sort_order column: {err}"))?;
+        // 为现有数据设置默认排序
+        conn.execute(
+            "UPDATE pools SET sort_order = id - 1 WHERE sort_order = 0",
+            [],
+        )
+        .map_err(|err| format!("Failed to initialize proxy sort_order: {err}"))?;
+    }
 
     let base_url_columns = table_columns(&conn, "pool_base_urls")?;
     if !base_url_columns.contains("name") {
@@ -605,6 +627,13 @@ fn init_database(path: &PathBuf) -> Result<(), String> {
             [],
         )
         .map_err(|err| format!("Failed to add supplier protocol column: {err}"))?;
+    }
+    if !base_url_columns.contains("override_model") {
+        conn.execute(
+            "ALTER TABLE pool_base_urls ADD COLUMN override_model TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(|err| format!("Failed to add supplier override_model column: {err}"))?;
     }
 
     let api_key_columns = table_columns(&conn, "pool_api_keys")?;
@@ -731,6 +760,7 @@ fn prepare_proxy_save_payload(payload: ProxySavePayload) -> Result<PreparedProxy
             name: supplier.name.trim().to_string(),
             base_url,
             protocol: supplier.protocol,
+            override_model: supplier.override_model,
             keys,
         });
     }
@@ -986,6 +1016,29 @@ fn normalize_base_url_orders(conn: &Connection, pool_id: i64) -> Result<(), Stri
     Ok(())
 }
 
+fn normalize_pool_orders(conn: &Connection) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare("SELECT id FROM pools ORDER BY sort_order ASC, id ASC")
+        .map_err(|err| format!("Failed to prepare pool order query: {err}"))?;
+    let ids = stmt
+        .query_map([], |row| row.get::<_, i64>(0))
+        .map_err(|err| format!("Failed to query pool order: {err}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| format!("Failed to decode pool order: {err}"))?;
+
+    for (index, id) in ids.into_iter().enumerate() {
+        conn.execute(
+            "UPDATE pools
+             SET sort_order = ?1, updated_at = strftime('%s', 'now')
+             WHERE id = ?2",
+            params![index as i64, id],
+        )
+        .map_err(|err| format!("Failed to normalize pool order: {err}"))?;
+    }
+
+    Ok(())
+}
+
 fn normalize_api_key_orders(conn: &Connection, base_url_id: i64) -> Result<(), String> {
     let mut stmt = conn
         .prepare(
@@ -1043,7 +1096,7 @@ fn load_pools(path: &PathBuf) -> Result<Vec<PoolConfig>, String> {
         .prepare(
             "SELECT id, name, note, is_active
              FROM pools
-             ORDER BY is_active DESC, created_at ASC, id ASC",
+             ORDER BY sort_order ASC, is_active DESC, created_at ASC, id ASC",
         )
         .map_err(|err| format!("Failed to prepare pool query: {err}"))?;
 
@@ -1065,7 +1118,7 @@ fn load_pools(path: &PathBuf) -> Result<Vec<PoolConfig>, String> {
 
         let mut base_stmt = conn
             .prepare(
-                "SELECT id, name, base_url, protocol_mode, sort_order
+                "SELECT id, name, base_url, protocol_mode, override_model, sort_order
                  FROM pool_base_urls
                  WHERE pool_id = ?1
                  ORDER BY sort_order ASC, id ASC",
@@ -1078,14 +1131,15 @@ fn load_pools(path: &PathBuf) -> Result<Vec<PoolConfig>, String> {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, String>(3)?,
-                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             })
             .map_err(|err| format!("Failed to query base_urls: {err}"))?;
 
         let mut base_urls = Vec::new();
         for base_row in base_rows {
-            let (base_url_id, supplier_name, base_url, protocol_mode, sort_order) =
+            let (base_url_id, supplier_name, base_url, protocol_mode, override_model, sort_order) =
                 base_row.map_err(|err| format!("Failed to decode base_url row: {err}"))?;
 
             let mut key_stmt = conn
@@ -1124,6 +1178,7 @@ fn load_pools(path: &PathBuf) -> Result<Vec<PoolConfig>, String> {
                 name: supplier_name,
                 base_url,
                 protocol_mode: ProtocolMode::from_str(&protocol_mode)?,
+                override_model,
                 sort_order,
                 api_keys,
             });
@@ -1620,6 +1675,15 @@ fn transform_request_body(body: &[u8], conversion: ConversionMode) -> Result<Vec
     }
 }
 
+fn override_model_in_body(body: &[u8], model: &str) -> Result<Vec<u8>, String> {
+    let mut value: Value = serde_json::from_slice(body)
+        .map_err(|err| format!("invalid request JSON: {err}"))?;
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("model".to_string(), Value::String(model.to_string()));
+    }
+    serde_json::to_vec(&value).map_err(|err| format!("failed to encode request: {err}"))
+}
+
 fn extract_chat_content(message: &Value) -> String {
     match message.get("content") {
         Some(Value::String(text)) => text.clone(),
@@ -1756,8 +1820,8 @@ fn responses_response_to_chat(body: &[u8]) -> Result<Vec<u8>, String> {
 fn transform_response_body(body: &[u8], conversion: ConversionMode) -> Result<Vec<u8>, String> {
     match conversion {
         ConversionMode::Direct => Ok(body.to_vec()),
-        ConversionMode::ChatToResponses => responses_response_to_chat(body),
-        ConversionMode::ResponsesToChat => chat_response_to_responses(body),
+        ConversionMode::ChatToResponses => chat_response_to_responses(body),
+        ConversionMode::ResponsesToChat => responses_response_to_chat(body),
     }
 }
 
@@ -1985,8 +2049,8 @@ fn transform_sse_event(
     let data = sse_data_payload(event)?;
     match conversion {
         ConversionMode::Direct => Some(format!("{event}\n\n")),
-        ConversionMode::ChatToResponses => responses_sse_to_chat_event(&data, completed_sent),
-        ConversionMode::ResponsesToChat => chat_sse_to_responses_event(&data, completed_sent),
+        ConversionMode::ChatToResponses => chat_sse_to_responses_event(&data, completed_sent),
+        ConversionMode::ResponsesToChat => responses_sse_to_chat_event(&data, completed_sent),
     }
 }
 
@@ -2356,6 +2420,7 @@ async fn pools_response(state: &AppState) -> ProxiesResponse {
                         name: base_url.name,
                         base_url: base_url.base_url,
                         protocol: base_url.protocol_mode,
+                        override_model: base_url.override_model,
                         sort_order: base_url.sort_order,
                         available_key_count,
                         total_key_count: keys.len(),
@@ -2545,9 +2610,15 @@ async fn save_proxy_draft(
                 let existing_count: i64 = tx
                     .query_row("SELECT COUNT(*) FROM pools", [], |row| row.get(0))
                     .map_err(|err| format!("Failed to query proxies: {err}"))?;
+                // 将新代理放在列表最前面
                 tx.execute(
-                    "INSERT INTO pools (name, note, is_active, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, strftime('%s', 'now'), strftime('%s', 'now'))",
+                    "UPDATE pools SET sort_order = sort_order + 1, updated_at = strftime('%s', 'now')",
+                    [],
+                )
+                .map_err(|err| format!("Failed to update proxy sort_order: {err}"))?;
+                tx.execute(
+                    "INSERT INTO pools (name, note, is_active, sort_order, created_at, updated_at)
+                     VALUES (?1, ?2, ?3, 0, strftime('%s', 'now'), strftime('%s', 'now'))",
                     params![
                         &payload.name,
                         &payload.note,
@@ -2615,13 +2686,14 @@ async fn save_proxy_draft(
 
                     tx.execute(
                         "UPDATE pool_base_urls
-                         SET name = ?1, base_url = ?2, protocol_mode = ?3, sort_order = ?4,
+                         SET name = ?1, base_url = ?2, protocol_mode = ?3, override_model = ?4, sort_order = ?5,
                              updated_at = strftime('%s', 'now')
-                         WHERE id = ?5",
+                         WHERE id = ?6",
                         params![
                             &supplier.name,
                             &supplier.base_url,
                             supplier.protocol.as_str(),
+                            &supplier.override_model,
                             supplier_sort_order as i64,
                             supplier_id
                         ],
@@ -2631,13 +2703,14 @@ async fn save_proxy_draft(
                 } else {
                     tx.execute(
                         "INSERT INTO pool_base_urls
-                         (pool_id, name, base_url, protocol_mode, sort_order, created_at, updated_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s', 'now'), strftime('%s', 'now'))",
+                         (pool_id, name, base_url, protocol_mode, override_model, sort_order, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s', 'now'), strftime('%s', 'now'))",
                         params![
                             saved_pool_id,
                             &supplier.name,
                             &supplier.base_url,
                             supplier.protocol.as_str(),
+                            &supplier.override_model,
                             supplier_sort_order as i64
                         ],
                     )
@@ -2778,15 +2851,58 @@ async fn create_pool(
             }
         };
 
+    // 将新代理放在列表最前面
     if let Err(err) = conn.execute(
-        "INSERT INTO pools (name, note, is_active, created_at, updated_at)
-         VALUES (?1, ?2, ?3, strftime('%s', 'now'), strftime('%s', 'now'))",
+        "UPDATE pools SET sort_order = sort_order + 1, updated_at = strftime('%s', 'now')",
+        [],
+    ) {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to update proxy sort_order: {err}"),
+        );
+    }
+
+    if let Err(err) = conn.execute(
+        "INSERT INTO pools (name, note, is_active, sort_order, created_at, updated_at)
+         VALUES (?1, ?2, ?3, 0, strftime('%s', 'now'), strftime('%s', 'now'))",
         params![name, note, if existing_count == 0 { 1 } else { 0 }],
     ) {
         return json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to create proxy: {err}"),
         );
+    }
+
+    if let Err(err) = reload_state(&state).await {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
+    }
+    json_ok()
+}
+
+#[derive(Deserialize)]
+struct ReorderPayload {
+    ids: Vec<i64>,
+}
+
+async fn reorder_pools(
+    State(state): State<AppState>,
+    Json(payload): Json<ReorderPayload>,
+) -> Response<Body> {
+    let conn = match open_db(&state.db_path) {
+        Ok(conn) => conn,
+        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+
+    for (index, id) in payload.ids.iter().enumerate() {
+        if let Err(err) = conn.execute(
+            "UPDATE pools SET sort_order = ?1, updated_at = strftime('%s', 'now') WHERE id = ?2",
+            params![index as i64, id],
+        ) {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to update proxy sort_order: {err}"),
+            );
+        }
     }
 
     if let Err(err) = reload_state(&state).await {
@@ -3051,6 +3167,11 @@ async fn delete_pool(State(state): State<AppState>, Path(id): Path<i64>) -> Resp
         );
     }
 
+    // 重新排序剩余的代理
+    if let Err(err) = normalize_pool_orders(&conn) {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
+    }
+
     if was_active {
         let next_pool_id: Option<i64> = match conn
             .query_row(
@@ -3130,13 +3251,14 @@ async fn create_base_url(
     });
 
     if let Err(err) = conn.execute(
-        "INSERT INTO pool_base_urls (pool_id, name, base_url, protocol_mode, sort_order, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s', 'now'), strftime('%s', 'now'))",
+        "INSERT INTO pool_base_urls (pool_id, name, base_url, protocol_mode, override_model, sort_order, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, strftime('%s', 'now'), strftime('%s', 'now'))",
         params![
             pool_id,
             supplier_name,
             base_url,
             payload.protocol.as_str(),
+            payload.override_model,
             sort_order
         ],
     ) {
@@ -3199,12 +3321,13 @@ async fn update_base_url(
     let sort_order = payload.sort_order.unwrap_or(current_sort_order);
     if let Err(err) = conn.execute(
         "UPDATE pool_base_urls
-         SET name = ?1, base_url = ?2, protocol_mode = ?3, sort_order = ?4, updated_at = strftime('%s', 'now')
-         WHERE id = ?5",
+         SET name = ?1, base_url = ?2, protocol_mode = ?3, override_model = ?4, sort_order = ?5, updated_at = strftime('%s', 'now')
+         WHERE id = ?6",
         params![
             supplier_name,
             base_url,
             payload.protocol.as_str(),
+            payload.override_model,
             sort_order,
             id
         ],
@@ -3799,6 +3922,14 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
             Ok(body) => body,
             Err(err) => return json_error(StatusCode::BAD_REQUEST, err),
         };
+        let upstream_body = if !base_url.override_model.is_empty() {
+            match override_model_in_body(&upstream_body, &base_url.override_model) {
+                Ok(body) => body,
+                Err(err) => return json_error(StatusCode::BAD_REQUEST, err),
+            }
+        } else {
+            upstream_body
+        };
         for key in base_url.api_keys {
             loop {
                 if !key_is_schedulable(&state, &key).await {
@@ -4040,6 +4171,7 @@ async fn main() {
         .route("/admin/keys", get(access_keys_page))
         .route("/admin/api/proxies", get(get_proxies).post(create_pool))
         .route("/admin/api/proxies/save", post(create_proxy_save))
+        .route("/admin/api/proxies/reorder", post(reorder_pools))
         .route(
             "/admin/api/access-keys",
             get(get_access_keys).post(create_access_key),
@@ -4416,6 +4548,7 @@ mod tests {
                     name TEXT NOT NULL DEFAULT '',
                     base_url TEXT NOT NULL,
                     protocol_mode TEXT NOT NULL DEFAULT 'both',
+                    override_model TEXT NOT NULL DEFAULT '',
                     sort_order INTEGER NOT NULL DEFAULT 0,
                     created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
                     updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now'))
