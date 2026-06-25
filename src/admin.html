@@ -1231,6 +1231,48 @@
       });
     }
 
+    function cleanPoolDragState() {
+      state.draggingPoolLocalId = null;
+      state.dragOverPoolLocalId = null;
+      state.dragOverPoolPosition = null;
+    }
+
+    function clearPoolDragClasses() {
+      document.querySelectorAll('[data-pool-card]').forEach(card => {
+        card.classList.remove('dragging', 'drag-over-before', 'drag-over-after');
+      });
+    }
+
+    async function reorderPools(sourceLocalId, targetLocalId, position) {
+      if (!sourceLocalId || !targetLocalId || sourceLocalId === targetLocalId) return false;
+
+      const sourceIndex = state.pools.findIndex(pool => pool.localId === sourceLocalId);
+      const targetIndex = state.pools.findIndex(pool => pool.localId === targetLocalId);
+      if (sourceIndex < 0 || targetIndex < 0) return false;
+
+      const [moved] = state.pools.splice(sourceIndex, 1);
+      const targetIndexAfterRemoval = state.pools.findIndex(pool => pool.localId === targetLocalId);
+      if (targetIndexAfterRemoval < 0) {
+        state.pools.splice(sourceIndex, 0, moved);
+        return false;
+      }
+
+      const insertIndex = position === 'after' ? targetIndexAfterRemoval + 1 : targetIndexAfterRemoval;
+      state.pools.splice(insertIndex, 0, moved);
+
+      const ids = state.pools.map(pool => pool.id).filter(id => id != null);
+      if (ids.length > 0) {
+        try {
+          await apiRequest('/admin/api/proxies/reorder', { method: 'POST', body: { ids } });
+        } catch (error) {
+          console.error('Failed to save pool order:', error);
+          await loadProxies();
+        }
+      }
+
+      return true;
+    }
+
     function reorderBaseUrls(sourceLocalId, targetLocalId, position) {
       const pool = currentEditablePool();
       if (!pool || !sourceLocalId || !targetLocalId || sourceLocalId === targetLocalId) return false;
