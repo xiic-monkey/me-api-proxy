@@ -2615,73 +2615,138 @@
 
     document.addEventListener('dragstart', event => {
       const handle = event.target.closest('[data-drag-handle]');
-      if (!handle) return;
+      if (handle) {
+        const baseLocalId = handle.dataset.baseLocalId;
+        if (!findDraftBase(baseLocalId)) return;
 
-      const baseLocalId = handle.dataset.baseLocalId;
-      if (!findDraftBase(baseLocalId)) return;
+        state.draggingBaseLocalId = baseLocalId;
+        state.dragOverBaseLocalId = null;
+        state.dragOverPosition = null;
 
-      state.draggingBaseLocalId = baseLocalId;
-      state.dragOverBaseLocalId = null;
-      state.dragOverPosition = null;
+        event.dataTransfer.effectAllowed = 'move';
+        event.dataTransfer.setData('text/plain', baseLocalId);
+        handle.closest('[data-base-card]')?.classList.add('dragging');
+        return;
+      }
+
+      const poolCard = event.target.closest('[data-pool-card]');
+      if (!poolCard) return;
+
+      const poolLocalId = poolCard.dataset.localId;
+      if (!poolLocalId) return;
+
+      state.draggingPoolLocalId = poolLocalId;
+      state.dragOverPoolLocalId = null;
+      state.dragOverPoolPosition = null;
 
       event.dataTransfer.effectAllowed = 'move';
-      event.dataTransfer.setData('text/plain', baseLocalId);
-      handle.closest('[data-base-card]')?.classList.add('dragging');
+      event.dataTransfer.setData('text/plain', poolLocalId);
+      poolCard.classList.add('dragging');
     });
 
     document.addEventListener('dragover', event => {
-      const card = event.target.closest('[data-base-card]');
-      if (!card || !state.draggingBaseLocalId) return;
+      const baseCard = event.target.closest('[data-base-card]');
+      if (baseCard && state.draggingBaseLocalId) {
+        const targetLocalId = baseCard.dataset.baseLocalId;
+        if (!targetLocalId || targetLocalId === state.draggingBaseLocalId) return;
 
-      const targetLocalId = card.dataset.baseLocalId;
-      if (!targetLocalId || targetLocalId === state.draggingBaseLocalId) return;
+        event.preventDefault();
+        event.dataTransfer.dropEffect = 'move';
 
-      event.preventDefault();
-      event.dataTransfer.dropEffect = 'move';
+        const rect = baseCard.getBoundingClientRect();
+        const position = event.clientY > rect.top + rect.height / 2 ? 'after' : 'before';
 
-      const rect = card.getBoundingClientRect();
-      const position = event.clientY > rect.top + rect.height / 2 ? 'after' : 'before';
+        if (state.dragOverBaseLocalId !== targetLocalId || state.dragOverPosition !== position) {
+          document.querySelectorAll('[data-base-card]').forEach(item => {
+            item.classList.remove('drag-over-before', 'drag-over-after');
+          });
+          state.dragOverBaseLocalId = targetLocalId;
+          state.dragOverPosition = position;
+          baseCard.classList.add(`drag-over-${position}`);
+        }
+        return;
+      }
 
-      if (state.dragOverBaseLocalId !== targetLocalId || state.dragOverPosition !== position) {
-        document.querySelectorAll('[data-base-card]').forEach(item => {
-          item.classList.remove('drag-over-before', 'drag-over-after');
-        });
-        state.dragOverBaseLocalId = targetLocalId;
-        state.dragOverPosition = position;
-        card.classList.add(`drag-over-${position}`);
+      const poolCard = event.target.closest('[data-pool-card]');
+      if (poolCard && state.draggingPoolLocalId) {
+        const targetLocalId = poolCard.dataset.localId;
+        if (!targetLocalId || targetLocalId === state.draggingPoolLocalId) return;
+
+        event.preventDefault();
+        event.dataTransfer.dropEffect = 'move';
+
+        const rect = poolCard.getBoundingClientRect();
+        const position = event.clientY > rect.top + rect.height / 2 ? 'after' : 'before';
+
+        if (state.dragOverPoolLocalId !== targetLocalId || state.dragOverPoolPosition !== position) {
+          document.querySelectorAll('[data-pool-card]').forEach(item => {
+            item.classList.remove('drag-over-before', 'drag-over-after');
+          });
+          state.dragOverPoolLocalId = targetLocalId;
+          state.dragOverPoolPosition = position;
+          poolCard.classList.add(`drag-over-${position}`);
+        }
       }
     });
 
     document.addEventListener('dragleave', event => {
-      const card = event.target.closest('[data-base-card]');
-      if (!card || card.contains(event.relatedTarget)) return;
-      card.classList.remove('drag-over-before', 'drag-over-after');
-      if (state.dragOverBaseLocalId === card.dataset.baseLocalId) {
-        state.dragOverBaseLocalId = null;
-        state.dragOverPosition = null;
+      const baseCard = event.target.closest('[data-base-card]');
+      if (baseCard && !baseCard.contains(event.relatedTarget)) {
+        baseCard.classList.remove('drag-over-before', 'drag-over-after');
+        if (state.dragOverBaseLocalId === baseCard.dataset.baseLocalId) {
+          state.dragOverBaseLocalId = null;
+          state.dragOverPosition = null;
+        }
+        return;
+      }
+
+      const poolCard = event.target.closest('[data-pool-card]');
+      if (poolCard && !poolCard.contains(event.relatedTarget)) {
+        poolCard.classList.remove('drag-over-before', 'drag-over-after');
+        if (state.dragOverPoolLocalId === poolCard.dataset.localId) {
+          state.dragOverPoolLocalId = null;
+          state.dragOverPoolPosition = null;
+        }
       }
     });
 
-    document.addEventListener('drop', event => {
-      const card = event.target.closest('[data-base-card]');
-      if (!card || !state.draggingBaseLocalId) return;
+    document.addEventListener('drop', async event => {
+      const baseCard = event.target.closest('[data-base-card]');
+      if (baseCard && state.draggingBaseLocalId) {
+        event.preventDefault();
+        const targetLocalId = baseCard.dataset.baseLocalId;
+        const position = state.dragOverPosition || 'before';
+        const didMove = reorderBaseUrls(state.draggingBaseLocalId, targetLocalId, position);
+        cleanDragState();
+        clearDragClasses();
 
-      event.preventDefault();
-      const targetLocalId = card.dataset.baseLocalId;
-      const position = state.dragOverPosition || 'before';
-      const didMove = reorderBaseUrls(state.draggingBaseLocalId, targetLocalId, position);
-      cleanDragState();
-      clearDragClasses();
+        if (didMove) {
+          markDirty();
+          render();
+        }
+        return;
+      }
 
-      if (didMove) {
-        markDirty();
-        render();
+      const poolCard = event.target.closest('[data-pool-card]');
+      if (poolCard && state.draggingPoolLocalId) {
+        event.preventDefault();
+        const targetLocalId = poolCard.dataset.localId;
+        const position = state.dragOverPoolPosition || 'before';
+        const didMove = await reorderPools(state.draggingPoolLocalId, targetLocalId, position);
+        cleanPoolDragState();
+        clearPoolDragClasses();
+
+        if (didMove) {
+          render();
+        }
       }
     });
 
     document.addEventListener('dragend', () => {
       cleanDragState();
       clearDragClasses();
+      cleanPoolDragState();
+      clearPoolDragClasses();
     });
 
     document.addEventListener('keydown', event => {
