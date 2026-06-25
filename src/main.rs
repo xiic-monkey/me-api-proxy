@@ -3871,6 +3871,26 @@ async fn proxy_for_access_key(
     Ok((pool, access_key))
 }
 
+fn build_override_models_response(model: &str) -> Response<Body> {
+    let response = serde_json::json!({
+        "object": "list",
+        "data": [
+            {
+                "id": model,
+                "object": "model",
+                "created": 0,
+                "owned_by": "proxy"
+            }
+        ]
+    });
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        response.to_string(),
+    )
+        .into_response()
+}
+
 async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<Body> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
@@ -3994,6 +4014,15 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                             );
                         }
                         mark_key_fail(&state, key.id, allow_auto_ban).await;
+
+                        if path == MODELS_PATH && !base_url.override_model.is_empty() {
+                            info!(
+                                "models fallback -> using override_model={} for supplier_id={}",
+                                base_url.override_model, base_url.id
+                            );
+                            return build_override_models_response(&base_url.override_model);
+                        }
+
                         last_error = Some(ProxyAttemptError {
                             body: format!("Upstream returned {}", status.as_u16()),
                         });
@@ -4086,6 +4115,15 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                             );
                         }
                         mark_key_fail(&state, key.id, allow_auto_ban).await;
+
+                        if path == MODELS_PATH && !base_url.override_model.is_empty() {
+                            info!(
+                                "models fallback -> using override_model={} for supplier_id={} (timeout)",
+                                base_url.override_model, base_url.id
+                            );
+                            return build_override_models_response(&base_url.override_model);
+                        }
+
                         last_error = Some(ProxyAttemptError {
                             body: "Gateway Timeout".to_string(),
                         });
@@ -4110,6 +4148,15 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                             );
                         }
                         mark_key_fail(&state, key.id, allow_auto_ban).await;
+
+                        if path == MODELS_PATH && !base_url.override_model.is_empty() {
+                            info!(
+                                "models fallback -> using override_model={} for supplier_id={} (error)",
+                                base_url.override_model, base_url.id
+                            );
+                            return build_override_models_response(&base_url.override_model);
+                        }
+
                         last_error = Some(ProxyAttemptError {
                             body: format!("Bad Gateway: {err}"),
                         });
