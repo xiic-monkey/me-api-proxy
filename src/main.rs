@@ -162,6 +162,40 @@ struct UpstreamPlan {
     conversion: ConversionMode,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ResponsesToolKind {
+    Function,
+    Namespace,
+    Custom,
+    ToolSearch,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ResponsesToolSpec {
+    kind: ResponsesToolKind,
+    name: String,
+    namespace: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ResponsesToolContext {
+    chat_tools: Vec<Value>,
+    chat_name_to_spec: HashMap<String, ResponsesToolSpec>,
+    namespace_name_to_chat_name: HashMap<(String, String), String>,
+    seen_chat_names: HashSet<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct BridgeContext {
+    responses_tool_context: Option<ResponsesToolContext>,
+}
+
+#[derive(Clone, Debug)]
+struct RequestTransformResult {
+    body: Vec<u8>,
+    bridge_context: BridgeContext,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 struct PoolConfig {
     id: i64,
@@ -461,6 +495,7 @@ struct SseTransformState {
     stream: BoxStream<'static, Result<Bytes, reqwest::Error>>,
     buffer: String,
     conversion: ConversionMode,
+    bridge_context: BridgeContext,
     completed_sent: bool,
 }
 
@@ -1543,18 +1578,348 @@ fn chat_request_to_responses(body: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|err| format!("failed to encode Responses request: {err}"))
 }
 
-fn has_responses_only_tool(value: &Value) -> bool {
-    value
-        .as_array()
-        .map(|tools| {
-            tools.iter().any(|tool| {
-                tool.get("type")
-                    .and_then(Value::as_str)
-                    .map(|kind| kind != "function")
-                    .unwrap_or(false)
-            })
+fn flatten_namespace_tool_name(namespace: &str, name: &str) -> String {
+    format!("{namespace}.{name}")
+}
+
+fn unique_chat_tool_name(context: &mut ResponsesToolContext, base: String) -> String {
+    if context.seen_chat_names.insert(base.clone()) {
+        return base;
+    }
+
+    let mut index = 2;
+    loop {
+        let candidate = format!("{base}_{index}");
+        if context.seen_chat_names.insert(candidate.clone()) {
+            return candidate;
+        }
+        index += 1;
+    }
+}
+
+fn string_input_parameters_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "input": { "type": "string" }
+        },
+        "required": ["input"],
+        "additionalProperties": false
+    })
+}
+
+fn tool_search_parameters_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "query": { "type": "string" },
+            "limit": { "type": "integer" }
+        },
+        "required": ["query"],
+        "additionalProperties": false
+    })
+}
+
+fn build_responses_tool_context(tools: Option<&Value>) -> ResponsesToolContext {
+    let mut context = ResponsesToolContext::default();
+    let Some(tools) = tools.and_then(Value::as_array) else {
+        return context;
+    };
+
+    for tool in tools {
+        let Some(object) = tool.as_object() else {
+            continue;
+        };
+        match object.get("type").and_then(Value::as_str) {
+            Some("function") => {
+                let Some(name) = object.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let chat_name = unique_chat_tool_name(&mut context, name.to_string());
+                context.chat_name_to_spec.insert(
+                    chat_name.clone(),
+                    ResponsesToolSpec {
+                        kind: ResponsesToolKind::Function,
+                        name: name.to_string(),
+                        namespace: None,
+                    },
+                );
+                let mut chat_tool = object.clone();
+                chat_tool.insert("type".to_string(), Value::String("function".to_string()));
+                chat_tool.insert("name".to_string(), Value::String(chat_name));
+                context.chat_tools.push(Value::Object(chat_tool));
+            }
+            Some("custom") => {
+                let Some(name) = object.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let chat_name = unique_chat_tool_name(&mut context, name.to_string());
+                context.chat_name_to_spec.insert(
+                    chat_name.clone(),
+                    ResponsesToolSpec {
+                        kind: ResponsesToolKind::Custom,
+                        name: name.to_string(),
+                        namespace: None,
+                    },
+                );
+                context.chat_tools.push(json!({
+                    "type": "function",
+                    "function": {
+                        "name": chat_name,
+                        "description": object.get("description").cloned().unwrap_or(Value::String(String::new())),
+                        "parameters": string_input_parameters_schema()
+                    }
+                }));
+            }
+            Some("tool_search") => {
+                let chat_name = unique_chat_tool_name(&mut context, "tool_search".to_string());
+                context.chat_name_to_spec.insert(
+                    chat_name.clone(),
+                    ResponsesToolSpec {
+                        kind: ResponsesToolKind::ToolSearch,
+                        name: "tool_search".to_string(),
+                        namespace: None,
+                    },
+                );
+                context.chat_tools.push(json!({
+                    "type": "function",
+                    "function": {
+                        "name": chat_name,
+                        "description": object.get("description").cloned().unwrap_or(Value::String("Search across available tools".to_string())),
+                        "parameters": tool_search_parameters_schema()
+                    }
+                }));
+            }
+            Some("namespace") => {
+                let Some(namespace) = object.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                let Some(functions) = object.get("tools").and_then(Value::as_array) else {
+                    continue;
+                };
+                for function in functions {
+                    let Some(function_object) = function.as_object() else {
+                        continue;
+                    };
+                    let Some(name) = function_object.get("name").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    let flattened = flatten_namespace_tool_name(namespace, name);
+                    let chat_name = unique_chat_tool_name(&mut context, flattened);
+                    context.namespace_name_to_chat_name.insert(
+                        (namespace.to_string(), name.to_string()),
+                        chat_name.clone(),
+                    );
+                    context.chat_name_to_spec.insert(
+                        chat_name.clone(),
+                        ResponsesToolSpec {
+                            kind: ResponsesToolKind::Namespace,
+                            name: name.to_string(),
+                            namespace: Some(namespace.to_string()),
+                        },
+                    );
+                    context.chat_tools.push(json!({
+                        "type": "function",
+                        "function": {
+                            "name": chat_name,
+                            "description": function_object.get("description").cloned().unwrap_or(Value::String(String::new())),
+                            "parameters": function_object.get("parameters").cloned().unwrap_or_else(|| json!({
+                                "type": "object",
+                                "properties": {},
+                                "additionalProperties": true
+                            }))
+                        }
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    context
+}
+
+fn chat_tool_name_for_response_tool(
+    context: &ResponsesToolContext,
+    name: &str,
+    namespace: Option<&str>,
+) -> String {
+    if let Some(namespace) = namespace {
+        if let Some(chat_name) = context
+            .namespace_name_to_chat_name
+            .get(&(namespace.to_string(), name.to_string()))
+        {
+            return chat_name.clone();
+        }
+        return flatten_namespace_tool_name(namespace, name);
+    }
+
+    context
+        .chat_name_to_spec
+        .iter()
+        .find_map(|(chat_name, spec)| {
+            (spec.name == name && spec.namespace.is_none()).then(|| chat_name.clone())
         })
-        .unwrap_or(false)
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn tool_name_from_choice(choice: &Map<String, Value>) -> Option<String> {
+    choice
+        .get("name")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            choice
+                .get("function")
+                .and_then(Value::as_object)
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn responses_tool_choice_to_chat(choice: &Value, context: &ResponsesToolContext) -> Value {
+    let Some(object) = choice.as_object() else {
+        return choice.clone();
+    };
+    let Some(kind) = object.get("type").and_then(Value::as_str) else {
+        return choice.clone();
+    };
+
+    match kind {
+        "function" => tool_name_from_choice(object)
+            .map(|name| {
+                let chat_name = chat_tool_name_for_response_tool(
+                    context,
+                    &name,
+                    object.get("namespace").and_then(Value::as_str),
+                );
+                json!({ "type": "function", "function": { "name": chat_name } })
+            })
+            .unwrap_or_else(|| choice.clone()),
+        "custom" => tool_name_from_choice(object)
+            .map(|name| json!({ "type": "function", "function": { "name": name } }))
+            .unwrap_or_else(|| choice.clone()),
+        "tool_search" => {
+            let name = tool_name_from_choice(object).unwrap_or_else(|| "tool_search".to_string());
+            let chat_name = chat_tool_name_for_response_tool(context, &name, None);
+            json!({ "type": "function", "function": { "name": chat_name } })
+        }
+        "namespace" => object
+            .get("tool")
+            .and_then(Value::as_str)
+            .map(|name| {
+                let namespace = object.get("name").and_then(Value::as_str).unwrap_or_default();
+                let chat_name = chat_tool_name_for_response_tool(context, name, Some(namespace));
+                json!({ "type": "function", "function": { "name": chat_name } })
+            })
+            .unwrap_or_else(|| choice.clone()),
+        _ => choice.clone(),
+    }
+}
+
+fn value_to_json_string(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        _ => serde_json::to_string(value).unwrap_or_else(|_| String::new()),
+    }
+}
+
+fn flush_pending_tool_calls(messages: &mut Vec<Value>, pending_tool_calls: &mut Vec<Value>) {
+    if pending_tool_calls.is_empty() {
+        return;
+    }
+    messages.push(json!({
+        "role": "assistant",
+        "content": Value::Null,
+        "tool_calls": std::mem::take(pending_tool_calls)
+    }));
+}
+
+fn responses_function_call_to_chat_tool_call(
+    item: &Map<String, Value>,
+    context: &ResponsesToolContext,
+) -> Value {
+    let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+    let namespace = item.get("namespace").and_then(Value::as_str);
+    let chat_name = chat_tool_name_for_response_tool(context, name, namespace);
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .cloned()
+        .unwrap_or(Value::String("call_0".to_string()));
+    let arguments = item
+        .get("arguments")
+        .map(value_to_json_string)
+        .unwrap_or_else(|| "{}".to_string());
+    json!({
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": chat_name,
+            "arguments": arguments
+        }
+    })
+}
+
+fn responses_custom_tool_call_to_chat_tool_call(
+    item: &Map<String, Value>,
+    context: &ResponsesToolContext,
+) -> Value {
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .cloned()
+        .unwrap_or(Value::String("call_0".to_string()));
+    let response_name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+    let name = Value::String(chat_tool_name_for_response_tool(context, response_name, None));
+    let input = item
+        .get("input")
+        .cloned()
+        .unwrap_or(Value::String(String::new()));
+    json!({
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": json!({ "input": input }).to_string()
+        }
+    })
+}
+
+fn responses_tool_search_call_to_chat_tool_call(
+    item: &Map<String, Value>,
+    context: &ResponsesToolContext,
+) -> Value {
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .cloned()
+        .unwrap_or(Value::String("call_0".to_string()));
+    let mut arguments = Map::new();
+    if let Some(query) = item.get("query") {
+        arguments.insert("query".to_string(), query.clone());
+    }
+    if let Some(limit) = item.get("limit") {
+        arguments.insert("limit".to_string(), limit.clone());
+    }
+    if arguments.is_empty() {
+        if let Some(value) = item.get("arguments").and_then(Value::as_object) {
+            arguments.extend(value.clone());
+        }
+    }
+    json!({
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": chat_tool_name_for_response_tool(
+                context,
+                item.get("name").and_then(Value::as_str).unwrap_or("tool_search"),
+                None
+            ),
+            "arguments": Value::Object(arguments).to_string()
+        }
+    })
 }
 
 fn responses_content_to_chat_content(content: &Value) -> Value {
@@ -1593,56 +1958,114 @@ fn responses_content_to_chat_content(content: &Value) -> Value {
     Value::Array(converted)
 }
 
-fn responses_input_to_chat_messages(input: &Value) -> Vec<Value> {
+fn responses_item_to_chat_message(
+    item: &Value,
+    context: &ResponsesToolContext,
+    messages: &mut Vec<Value>,
+    pending_tool_calls: &mut Vec<Value>,
+) {
+    let Some(object) = item.as_object() else {
+        flush_pending_tool_calls(messages, pending_tool_calls);
+        messages.push(json!({ "role": "user", "content": item }));
+        return;
+    };
+
+    match object.get("type").and_then(Value::as_str) {
+        Some("function_call") => {
+            pending_tool_calls.push(responses_function_call_to_chat_tool_call(object, context));
+        }
+        Some("custom_tool_call") => {
+            pending_tool_calls.push(responses_custom_tool_call_to_chat_tool_call(object, context));
+        }
+        Some("tool_search_call") => {
+            pending_tool_calls.push(responses_tool_search_call_to_chat_tool_call(object, context));
+        }
+        Some("function_call_output") | Some("custom_tool_call_output") | Some("tool_search_output") => {
+            flush_pending_tool_calls(messages, pending_tool_calls);
+            let tool_call_id = object
+                .get("call_id")
+                .or_else(|| object.get("id"))
+                .cloned()
+                .unwrap_or(Value::String("call_0".to_string()));
+            let content = object
+                .get("output")
+                .map(value_to_json_string)
+                .unwrap_or_else(|| value_to_json_string(item));
+            messages.push(json!({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": content
+            }));
+        }
+        Some("message") | None => {
+            if let Some(role) = object.get("role").and_then(Value::as_str) {
+                flush_pending_tool_calls(messages, pending_tool_calls);
+                let chat_role = match role {
+                    "developer" => "system",
+                    other => other,
+                };
+                messages.push(json!({
+                    "role": chat_role,
+                    "content": object
+                        .get("content")
+                        .map(responses_content_to_chat_content)
+                        .unwrap_or(Value::String(String::new()))
+                }));
+            } else {
+                flush_pending_tool_calls(messages, pending_tool_calls);
+                messages.push(json!({ "role": "user", "content": item }));
+            }
+        }
+        _ => {
+            if let Some(role) = object.get("role").and_then(Value::as_str) {
+                flush_pending_tool_calls(messages, pending_tool_calls);
+                messages.push(json!({
+                    "role": role,
+                    "content": object
+                        .get("content")
+                        .map(responses_content_to_chat_content)
+                        .unwrap_or_else(|| item.clone())
+                }));
+            } else {
+                flush_pending_tool_calls(messages, pending_tool_calls);
+                messages.push(json!({ "role": "user", "content": item }));
+            }
+        }
+    }
+}
+
+fn responses_input_to_chat_messages(input: &Value, context: &ResponsesToolContext) -> Vec<Value> {
     match input {
         Value::String(text) => vec![json!({ "role": "user", "content": text })],
-        Value::Array(items) => items
-            .iter()
-            .map(|item| {
-                if let Some(object) = item.as_object() {
-                    if let Some(role) = object.get("role").and_then(Value::as_str) {
-                        return json!({
-                            "role": role,
-                            "content": object
-                                .get("content")
-                                .map(responses_content_to_chat_content)
-                                .unwrap_or(Value::String(String::new()))
-                        });
-                    }
-                }
-                json!({ "role": "user", "content": item })
-            })
-            .collect(),
+        Value::Array(items) => {
+            let mut messages = Vec::new();
+            let mut pending_tool_calls = Vec::new();
+            for item in items {
+                responses_item_to_chat_message(item, context, &mut messages, &mut pending_tool_calls);
+            }
+            flush_pending_tool_calls(&mut messages, &mut pending_tool_calls);
+            messages
+        }
         _ => vec![json!({ "role": "user", "content": input })],
     }
 }
 
-fn responses_request_to_chat(body: &[u8]) -> Result<Vec<u8>, String> {
+fn responses_request_to_chat(body: &[u8]) -> Result<RequestTransformResult, String> {
     let value: Value = serde_json::from_slice(body)
         .map_err(|err| format!("invalid Responses request JSON: {err}"))?;
     let object = value
         .as_object()
         .ok_or_else(|| "Responses request must be a JSON object".to_string())?;
 
-    if object
-        .get("tools")
-        .map(has_responses_only_tool)
-        .unwrap_or(false)
-    {
-        return Err(
-            "Responses built-in tools cannot be converted to a Chat Completions upstream"
-                .to_string(),
-        );
-    }
-
     let input = object
         .get("input")
         .ok_or_else(|| "Responses request is missing input".to_string())?;
+    let tool_context = build_responses_tool_context(object.get("tools"));
     let mut messages = Vec::new();
     if let Some(instructions) = object.get("instructions") {
         messages.push(json!({ "role": "system", "content": instructions }));
     }
-    messages.extend(responses_input_to_chat_messages(input));
+    messages.extend(responses_input_to_chat_messages(input, &tool_context));
 
     let mut target = Map::new();
     target.insert("messages".to_string(), Value::Array(messages));
@@ -1652,8 +2075,6 @@ fn responses_request_to_chat(body: &[u8]) -> Result<Vec<u8>, String> {
         "stream",
         "temperature",
         "top_p",
-        "tools",
-        "tool_choice",
         "parallel_tool_calls",
         "metadata",
         "user",
@@ -1661,16 +2082,42 @@ fn responses_request_to_chat(body: &[u8]) -> Result<Vec<u8>, String> {
     ] {
         copy_field(object, &mut target, field);
     }
+    if !tool_context.chat_tools.is_empty() {
+        target.insert("tools".to_string(), Value::Array(tool_context.chat_tools.clone()));
+    }
+    if let Some(tool_choice) = object.get("tool_choice") {
+        target.insert(
+            "tool_choice".to_string(),
+            responses_tool_choice_to_chat(tool_choice, &tool_context),
+        );
+    }
     copy_renamed_field(object, &mut target, "max_output_tokens", "max_tokens");
 
-    serde_json::to_vec(&Value::Object(target))
-        .map_err(|err| format!("failed to encode Chat Completions request: {err}"))
+    let body = serde_json::to_vec(&Value::Object(target))
+        .map_err(|err| format!("failed to encode Chat Completions request: {err}"))?;
+    Ok(RequestTransformResult {
+        body,
+        bridge_context: BridgeContext {
+            responses_tool_context: (!tool_context.chat_name_to_spec.is_empty()).then_some(tool_context),
+        },
+    })
 }
 
-fn transform_request_body(body: &[u8], conversion: ConversionMode) -> Result<Vec<u8>, String> {
+fn transform_request_body(
+    body: &[u8],
+    conversion: ConversionMode,
+) -> Result<RequestTransformResult, String> {
     match conversion {
-        ConversionMode::Direct => Ok(body.to_vec()),
-        ConversionMode::ChatToResponses => chat_request_to_responses(body),
+        ConversionMode::Direct => Ok(RequestTransformResult {
+            body: body.to_vec(),
+            bridge_context: BridgeContext::default(),
+        }),
+        ConversionMode::ChatToResponses => chat_request_to_responses(body).map(|body| {
+            RequestTransformResult {
+                body,
+                bridge_context: BridgeContext::default(),
+            }
+        }),
         ConversionMode::ResponsesToChat => responses_request_to_chat(body),
     }
 }
@@ -1711,7 +2158,81 @@ fn chat_usage_to_responses_usage(usage: Option<&Value>) -> Value {
     })
 }
 
-fn chat_response_to_responses(body: &[u8]) -> Result<Vec<u8>, String> {
+fn parse_tool_arguments(arguments: Option<&Value>) -> Value {
+    let Some(arguments) = arguments else {
+        return json!({});
+    };
+    match arguments {
+        Value::String(text) => serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.clone())),
+        value => value.clone(),
+    }
+}
+
+fn chat_tool_call_to_responses_item(
+    tool_call: &Value,
+    context: Option<&ResponsesToolContext>,
+) -> Value {
+    let call_id = tool_call
+        .get("id")
+        .cloned()
+        .unwrap_or(Value::String("call_0".to_string()));
+    let chat_name = tool_call
+        .pointer("/function/name")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let arguments = parse_tool_arguments(tool_call.pointer("/function/arguments"));
+    let spec = context.and_then(|ctx| ctx.chat_name_to_spec.get(chat_name));
+
+    match spec.map(|item| &item.kind) {
+        Some(ResponsesToolKind::Custom) => json!({
+            "type": "custom_tool_call",
+            "id": call_id.clone(),
+            "call_id": call_id,
+            "name": spec.map(|item| item.name.clone()).unwrap_or_else(|| chat_name.to_string()),
+            "input": arguments.get("input").cloned().unwrap_or(Value::String(String::new()))
+        }),
+        Some(ResponsesToolKind::ToolSearch) => {
+            let mut value = json!({
+                "type": "tool_search_call",
+                "id": call_id.clone(),
+                "call_id": call_id
+            });
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "name".to_string(),
+                    Value::String(spec.map(|item| item.name.clone()).unwrap_or_else(|| chat_name.to_string())),
+                );
+                if let Some(query) = arguments.get("query") {
+                    obj.insert("query".to_string(), query.clone());
+                }
+                if let Some(limit) = arguments.get("limit") {
+                    obj.insert("limit".to_string(), limit.clone());
+                }
+            }
+            value
+        }
+        Some(ResponsesToolKind::Namespace) | Some(ResponsesToolKind::Function) | None => {
+            let mut value = json!({
+                "type": "function_call",
+                "id": call_id.clone(),
+                "call_id": call_id,
+                "name": spec.map(|item| item.name.clone()).unwrap_or_else(|| chat_name.to_string()),
+                "arguments": tool_call.pointer("/function/arguments").cloned().unwrap_or(Value::String(String::new()))
+            });
+            if let Some(namespace) = spec.and_then(|item| item.namespace.clone()) {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert("namespace".to_string(), Value::String(namespace));
+                }
+            }
+            value
+        }
+    }
+}
+
+fn chat_response_to_responses(
+    body: &[u8],
+    context: Option<&ResponsesToolContext>,
+) -> Result<Vec<u8>, String> {
     let value: Value = serde_json::from_slice(body)
         .map_err(|err| format!("invalid Chat Completions response JSON: {err}"))?;
     let first_choice = value
@@ -1738,13 +2259,7 @@ fn chat_response_to_responses(body: &[u8]) -> Result<Vec<u8>, String> {
     }
     if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
         for tool_call in tool_calls {
-            output.push(json!({
-                "type": "function_call",
-                "id": tool_call.get("id").cloned().unwrap_or(Value::Null),
-                "call_id": tool_call.get("id").cloned().unwrap_or(Value::Null),
-                "name": tool_call.pointer("/function/name").cloned().unwrap_or(Value::Null),
-                "arguments": tool_call.pointer("/function/arguments").cloned().unwrap_or(Value::String(String::new()))
-            }));
+            output.push(chat_tool_call_to_responses_item(tool_call, context));
         }
     }
 
@@ -1817,11 +2332,17 @@ fn responses_response_to_chat(body: &[u8]) -> Result<Vec<u8>, String> {
     .map_err(|err| format!("failed to encode Chat Completions response: {err}"))
 }
 
-fn transform_response_body(body: &[u8], conversion: ConversionMode) -> Result<Vec<u8>, String> {
+fn transform_response_body(
+    body: &[u8],
+    conversion: ConversionMode,
+    bridge_context: &BridgeContext,
+) -> Result<Vec<u8>, String> {
     match conversion {
         ConversionMode::Direct => Ok(body.to_vec()),
-        ConversionMode::ChatToResponses => chat_response_to_responses(body),
-        ConversionMode::ResponsesToChat => responses_response_to_chat(body),
+        ConversionMode::ChatToResponses => responses_response_to_chat(body),
+        ConversionMode::ResponsesToChat => {
+            chat_response_to_responses(body, bridge_context.responses_tool_context.as_ref())
+        }
     }
 }
 
@@ -2044,29 +2565,40 @@ fn responses_sse_to_chat_event(data: &str, completed_sent: &mut bool) -> Option<
 fn transform_sse_event(
     event: &str,
     conversion: ConversionMode,
+    _bridge_context: &BridgeContext,
     completed_sent: &mut bool,
 ) -> Option<String> {
     let data = sse_data_payload(event)?;
     match conversion {
         ConversionMode::Direct => Some(format!("{event}\n\n")),
-        ConversionMode::ChatToResponses => chat_sse_to_responses_event(&data, completed_sent),
-        ConversionMode::ResponsesToChat => responses_sse_to_chat_event(&data, completed_sent),
+        ConversionMode::ChatToResponses => responses_sse_to_chat_event(&data, completed_sent),
+        ConversionMode::ResponsesToChat => chat_sse_to_responses_event(&data, completed_sent),
     }
 }
 
-fn transformed_sse_body(response: reqwest::Response, conversion: ConversionMode) -> Body {
+fn transformed_sse_body(
+    response: reqwest::Response,
+    conversion: ConversionMode,
+    bridge_context: BridgeContext,
+) -> Body {
     let state = SseTransformState {
         stream: response.bytes_stream().boxed(),
         buffer: String::new(),
         conversion,
+        bridge_context,
         completed_sent: false,
     };
 
     let stream = futures_util::stream::unfold(state, |mut state| async move {
         loop {
-            if let Some(event) = pop_sse_event(&mut state.buffer) {
-                if let Some(output) =
-                    transform_sse_event(&event, state.conversion, &mut state.completed_sent)
+                if let Some(event) = pop_sse_event(&mut state.buffer) {
+                    if let Some(output) =
+                        transform_sse_event(
+                            &event,
+                            state.conversion,
+                            &state.bridge_context,
+                            &mut state.completed_sent,
+                        )
                 {
                     return Some((Ok::<Bytes, io::Error>(Bytes::from(output)), state));
                 }
@@ -2088,7 +2620,12 @@ fn transformed_sse_body(response: reqwest::Response, conversion: ConversionMode)
                     if !state.buffer.trim().is_empty() {
                         let event = std::mem::take(&mut state.buffer);
                         if let Some(output) =
-                            transform_sse_event(&event, state.conversion, &mut state.completed_sent)
+                            transform_sse_event(
+                                &event,
+                                state.conversion,
+                                &state.bridge_context,
+                                &mut state.completed_sent,
+                            )
                         {
                             return Some((Ok(Bytes::from(output)), state));
                         }
@@ -3938,10 +4475,12 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
             }
             None => (path.clone(), ConversionMode::Direct),
         };
-        let upstream_body = match transform_request_body(&buffered_body, conversion) {
-            Ok(body) => body,
+        let transformed_request = match transform_request_body(&buffered_body, conversion) {
+            Ok(result) => result,
             Err(err) => return json_error(StatusCode::BAD_REQUEST, err),
         };
+        let mut bridge_context = transformed_request.bridge_context.clone();
+        let upstream_body = transformed_request.body;
         let upstream_body = if !base_url.override_model.is_empty() {
             match override_model_in_body(&upstream_body, &base_url.override_model) {
                 Ok(body) => body,
@@ -4070,7 +4609,11 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
 
                         if conversion != ConversionMode::Direct && is_streaming {
                             return downstream
-                                .body(transformed_sse_body(response, conversion))
+                                .body(transformed_sse_body(
+                                    response,
+                                    conversion,
+                                    std::mem::take(&mut bridge_context),
+                                ))
                                 .unwrap_or_else(|err| {
                                     error!("Failed to build transformed stream response: {err}");
                                     StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -4088,7 +4631,7 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                                         .into_response();
                                 }
                             };
-                            let body = match transform_response_body(&body, conversion) {
+                            let body = match transform_response_body(&body, conversion, &bridge_context) {
                                 Ok(body) => body,
                                 Err(err) => return (StatusCode::BAD_GATEWAY, err).into_response(),
                             };
@@ -4391,14 +4934,33 @@ mod tests {
             "max_output_tokens":64
         }"#;
 
-        let converted: Value =
-            serde_json::from_slice(&responses_request_to_chat(body).unwrap()).unwrap();
+        let converted_request = responses_request_to_chat(body).unwrap();
+        let converted: Value = serde_json::from_slice(&converted_request.body).unwrap();
 
         assert_eq!(converted["model"], "gpt-test");
         assert_eq!(converted["messages"][0]["role"], "system");
         assert_eq!(converted["messages"][1]["role"], "user");
         assert_eq!(converted["messages"][1]["content"], "hello");
         assert_eq!(converted["max_tokens"], 64);
+    }
+
+    #[test]
+    fn converts_responses_custom_tool_to_chat_function_tool() {
+        let body = br#"{
+            "model":"gpt-test",
+            "input":"hello",
+            "tools":[{"type":"custom","name":"run_shell","description":"Run shell"}]
+        }"#;
+
+        let converted_request = responses_request_to_chat(body).unwrap();
+        let converted: Value = serde_json::from_slice(&converted_request.body).unwrap();
+
+        assert_eq!(converted["tools"][0]["type"], "function");
+        assert_eq!(converted["tools"][0]["function"]["name"], "run_shell");
+        assert_eq!(
+            converted["tools"][0]["function"]["parameters"]["required"][0],
+            "input"
+        );
     }
 
     #[test]
@@ -4412,11 +4974,46 @@ mod tests {
         }"#;
 
         let converted: Value =
-            serde_json::from_slice(&chat_response_to_responses(body).unwrap()).unwrap();
+            serde_json::from_slice(&chat_response_to_responses(body, None).unwrap()).unwrap();
 
         assert_eq!(converted["object"], "response");
         assert_eq!(converted["output_text"], "hello");
         assert_eq!(converted["usage"]["input_tokens"], 2);
+    }
+
+    #[test]
+    fn converts_chat_tool_call_back_to_custom_tool_call() {
+        let body = br#"{
+            "id":"chatcmpl_1",
+            "created":123,
+            "model":"gpt-test",
+            "choices":[{
+                "message":{
+                    "role":"assistant",
+                    "content":"",
+                    "tool_calls":[{
+                        "id":"call_1",
+                        "type":"function",
+                        "function":{
+                            "name":"run_shell",
+                            "arguments":"{\"input\":\"ls\"}"
+                        }
+                    }]
+                }
+            }]
+        }"#;
+        let context = build_responses_tool_context(Some(&json!([
+            {"type":"custom","name":"run_shell","description":"Run shell"}
+        ])));
+
+        let converted: Value = serde_json::from_slice(
+            &chat_response_to_responses(body, Some(&context)).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(converted["output"][0]["type"], "custom_tool_call");
+        assert_eq!(converted["output"][0]["name"], "run_shell");
+        assert_eq!(converted["output"][0]["input"], "ls");
     }
 
     #[test]
