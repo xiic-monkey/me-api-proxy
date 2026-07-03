@@ -234,6 +234,7 @@ struct AccessKeyConfig {
     name: String,
     access_key: String,
     proxy_id: i64,
+    override_model: String,
     created_at: i64,
     updated_at: i64,
 }
@@ -310,6 +311,11 @@ struct KeyModelsResponse {
     selected_model: Option<String>,
     selected_protocol: Option<TestProtocol>,
     supplier_protocol: ProtocolMode,
+}
+
+#[derive(Debug, Serialize)]
+struct SupplierModelsResponse {
+    models: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -401,6 +407,8 @@ struct PreparedApiKeySave {
 struct AccessKeyPayload {
     name: String,
     proxy_id: i64,
+    #[serde(default)]
+    override_model: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -470,6 +478,7 @@ struct AccessKeyView {
     masked_key: String,
     proxy_id: i64,
     proxy_name: String,
+    override_model: String,
     created_at: i64,
     updated_at: i64,
     last_used_supplier_name: Option<String>,
@@ -481,6 +490,14 @@ struct AccessKeyView {
 struct ProxyOptionView {
     id: i64,
     name: String,
+    suppliers: Vec<SupplierOptionView>,
+}
+
+#[derive(Debug, Serialize)]
+struct SupplierOptionView {
+    id: i64,
+    name: String,
+    base_url: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -618,6 +635,7 @@ fn init_database(path: &PathBuf) -> Result<(), String> {
             name TEXT NOT NULL,
             access_key TEXT NOT NULL UNIQUE,
             proxy_id INTEGER NOT NULL,
+            override_model TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
             updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
             FOREIGN KEY (proxy_id) REFERENCES pools(id) ON DELETE CASCADE
@@ -685,6 +703,15 @@ fn init_database(path: &PathBuf) -> Result<(), String> {
             [],
         )
         .map_err(|err| format!("Failed to add api_key test protocol column: {err}"))?;
+    }
+
+    let access_key_columns = table_columns(&conn, "access_keys")?;
+    if !access_key_columns.contains("override_model") {
+        conn.execute(
+            "ALTER TABLE access_keys ADD COLUMN override_model TEXT NOT NULL DEFAULT ''",
+            [],
+        )
+        .map_err(|err| format!("Failed to add access key override_model column: {err}"))?;
     }
 
     migrate_legacy_openai_config(&conn)?;
@@ -1235,7 +1262,7 @@ fn load_access_keys(path: &PathBuf) -> Result<Vec<AccessKeyConfig>, String> {
     let conn = open_db(path)?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, name, access_key, proxy_id, created_at, updated_at
+            "SELECT id, name, access_key, proxy_id, override_model, created_at, updated_at
              FROM access_keys
              ORDER BY created_at DESC, id DESC",
         )
@@ -1247,8 +1274,9 @@ fn load_access_keys(path: &PathBuf) -> Result<Vec<AccessKeyConfig>, String> {
                 name: row.get(1)?,
                 access_key: row.get(2)?,
                 proxy_id: row.get(3)?,
-                created_at: row.get(4)?,
-                updated_at: row.get(5)?,
+                override_model: row.get(4)?,
+                created_at: row.get(5)?,
+                updated_at: row.get(6)?,
             })
         })
         .map_err(|err| format!("Failed to query access keys: {err}"))?;
@@ -1706,10 +1734,9 @@ fn build_responses_tool_context(tools: Option<&Value>) -> ResponsesToolContext {
                     };
                     let flattened = flatten_namespace_tool_name(namespace, name);
                     let chat_name = unique_chat_tool_name(&mut context, flattened);
-                    context.namespace_name_to_chat_name.insert(
-                        (namespace.to_string(), name.to_string()),
-                        chat_name.clone(),
-                    );
+                    context
+                        .namespace_name_to_chat_name
+                        .insert((namespace.to_string(), name.to_string()), chat_name.clone());
                     context.chat_name_to_spec.insert(
                         chat_name.clone(),
                         ResponsesToolSpec {
@@ -1809,7 +1836,10 @@ fn responses_tool_choice_to_chat(choice: &Value, context: &ResponsesToolContext)
             .get("tool")
             .and_then(Value::as_str)
             .map(|name| {
-                let namespace = object.get("name").and_then(Value::as_str).unwrap_or_default();
+                let namespace = object
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
                 let chat_name = chat_tool_name_for_response_tool(context, name, Some(namespace));
                 json!({ "type": "function", "function": { "name": chat_name } })
             })
@@ -1872,7 +1902,11 @@ fn responses_custom_tool_call_to_chat_tool_call(
         .cloned()
         .unwrap_or(Value::String("call_0".to_string()));
     let response_name = item.get("name").and_then(Value::as_str).unwrap_or_default();
-    let name = Value::String(chat_tool_name_for_response_tool(context, response_name, None));
+    let name = Value::String(chat_tool_name_for_response_tool(
+        context,
+        response_name,
+        None,
+    ));
     let input = item
         .get("input")
         .cloned()
@@ -1975,12 +2009,18 @@ fn responses_item_to_chat_message(
             pending_tool_calls.push(responses_function_call_to_chat_tool_call(object, context));
         }
         Some("custom_tool_call") => {
-            pending_tool_calls.push(responses_custom_tool_call_to_chat_tool_call(object, context));
+            pending_tool_calls.push(responses_custom_tool_call_to_chat_tool_call(
+                object, context,
+            ));
         }
         Some("tool_search_call") => {
-            pending_tool_calls.push(responses_tool_search_call_to_chat_tool_call(object, context));
+            pending_tool_calls.push(responses_tool_search_call_to_chat_tool_call(
+                object, context,
+            ));
         }
-        Some("function_call_output") | Some("custom_tool_call_output") | Some("tool_search_output") => {
+        Some("function_call_output")
+        | Some("custom_tool_call_output")
+        | Some("tool_search_output") => {
             flush_pending_tool_calls(messages, pending_tool_calls);
             let tool_call_id = object
                 .get("call_id")
@@ -2041,7 +2081,12 @@ fn responses_input_to_chat_messages(input: &Value, context: &ResponsesToolContex
             let mut messages = Vec::new();
             let mut pending_tool_calls = Vec::new();
             for item in items {
-                responses_item_to_chat_message(item, context, &mut messages, &mut pending_tool_calls);
+                responses_item_to_chat_message(
+                    item,
+                    context,
+                    &mut messages,
+                    &mut pending_tool_calls,
+                );
             }
             flush_pending_tool_calls(&mut messages, &mut pending_tool_calls);
             messages
@@ -2083,7 +2128,10 @@ fn responses_request_to_chat(body: &[u8]) -> Result<RequestTransformResult, Stri
         copy_field(object, &mut target, field);
     }
     if !tool_context.chat_tools.is_empty() {
-        target.insert("tools".to_string(), Value::Array(tool_context.chat_tools.clone()));
+        target.insert(
+            "tools".to_string(),
+            Value::Array(tool_context.chat_tools.clone()),
+        );
     }
     if let Some(tool_choice) = object.get("tool_choice") {
         target.insert(
@@ -2098,7 +2146,8 @@ fn responses_request_to_chat(body: &[u8]) -> Result<RequestTransformResult, Stri
     Ok(RequestTransformResult {
         body,
         bridge_context: BridgeContext {
-            responses_tool_context: (!tool_context.chat_name_to_spec.is_empty()).then_some(tool_context),
+            responses_tool_context: (!tool_context.chat_name_to_spec.is_empty())
+                .then_some(tool_context),
         },
     })
 }
@@ -2112,23 +2161,35 @@ fn transform_request_body(
             body: body.to_vec(),
             bridge_context: BridgeContext::default(),
         }),
-        ConversionMode::ChatToResponses => chat_request_to_responses(body).map(|body| {
-            RequestTransformResult {
+        ConversionMode::ChatToResponses => {
+            chat_request_to_responses(body).map(|body| RequestTransformResult {
                 body,
                 bridge_context: BridgeContext::default(),
-            }
-        }),
+            })
+        }
         ConversionMode::ResponsesToChat => responses_request_to_chat(body),
     }
 }
 
 fn override_model_in_body(body: &[u8], model: &str) -> Result<Vec<u8>, String> {
-    let mut value: Value = serde_json::from_slice(body)
-        .map_err(|err| format!("invalid request JSON: {err}"))?;
+    let mut value: Value =
+        serde_json::from_slice(body).map_err(|err| format!("invalid request JSON: {err}"))?;
     if let Some(obj) = value.as_object_mut() {
         obj.insert("model".to_string(), Value::String(model.to_string()));
     }
     serde_json::to_vec(&value).map_err(|err| format!("failed to encode request: {err}"))
+}
+
+fn effective_override_model<'a>(
+    access_key: &'a AccessKeyConfig,
+    base_url: &'a BaseUrlConfig,
+) -> Option<&'a str> {
+    let access_key_model = access_key.override_model.trim();
+    if !access_key_model.is_empty() {
+        return Some(access_key_model);
+    }
+    let supplier_model = base_url.override_model.trim();
+    (!supplier_model.is_empty()).then_some(supplier_model)
 }
 
 fn extract_chat_content(message: &Value) -> String {
@@ -2163,7 +2224,9 @@ fn parse_tool_arguments(arguments: Option<&Value>) -> Value {
         return json!({});
     };
     match arguments {
-        Value::String(text) => serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.clone())),
+        Value::String(text) => {
+            serde_json::from_str(text).unwrap_or_else(|_| Value::String(text.clone()))
+        }
         value => value.clone(),
     }
 }
@@ -2200,7 +2263,10 @@ fn chat_tool_call_to_responses_item(
             if let Some(obj) = value.as_object_mut() {
                 obj.insert(
                     "name".to_string(),
-                    Value::String(spec.map(|item| item.name.clone()).unwrap_or_else(|| chat_name.to_string())),
+                    Value::String(
+                        spec.map(|item| item.name.clone())
+                            .unwrap_or_else(|| chat_name.to_string()),
+                    ),
                 );
                 if let Some(query) = arguments.get("query") {
                     obj.insert("query".to_string(), query.clone());
@@ -2591,15 +2657,13 @@ fn transformed_sse_body(
 
     let stream = futures_util::stream::unfold(state, |mut state| async move {
         loop {
-                if let Some(event) = pop_sse_event(&mut state.buffer) {
-                    if let Some(output) =
-                        transform_sse_event(
-                            &event,
-                            state.conversion,
-                            &state.bridge_context,
-                            &mut state.completed_sent,
-                        )
-                {
+            if let Some(event) = pop_sse_event(&mut state.buffer) {
+                if let Some(output) = transform_sse_event(
+                    &event,
+                    state.conversion,
+                    &state.bridge_context,
+                    &mut state.completed_sent,
+                ) {
                     return Some((Ok::<Bytes, io::Error>(Bytes::from(output)), state));
                 }
                 continue;
@@ -2619,14 +2683,12 @@ fn transformed_sse_body(
                 None => {
                     if !state.buffer.trim().is_empty() {
                         let event = std::mem::take(&mut state.buffer);
-                        if let Some(output) =
-                            transform_sse_event(
-                                &event,
-                                state.conversion,
-                                &state.bridge_context,
-                                &mut state.completed_sent,
-                            )
-                        {
+                        if let Some(output) = transform_sse_event(
+                            &event,
+                            state.conversion,
+                            &state.bridge_context,
+                            &mut state.completed_sent,
+                        ) {
                             return Some((Ok(Bytes::from(output)), state));
                         }
                     }
@@ -3029,6 +3091,15 @@ async fn access_keys_response(state: &AppState) -> AccessKeysResponse {
         .map(|pool| ProxyOptionView {
             id: pool.id,
             name: pool.name,
+            suppliers: pool
+                .base_urls
+                .into_iter()
+                .map(|supplier| SupplierOptionView {
+                    id: supplier.id,
+                    name: supplier.name,
+                    base_url: supplier.base_url,
+                })
+                .collect(),
         })
         .collect();
 
@@ -3044,6 +3115,7 @@ async fn access_keys_response(state: &AppState) -> AccessKeysResponse {
                 .get(&access_key.proxy_id)
                 .cloned()
                 .unwrap_or_else(|| "已删除代理".to_string()),
+            override_model: access_key.override_model,
             created_at: access_key.created_at,
             updated_at: access_key.updated_at,
             last_used_supplier_name: usage
@@ -3500,6 +3572,7 @@ async fn create_access_key(
         Ok(name) => name,
         Err(err) => return json_error(StatusCode::BAD_REQUEST, err),
     };
+    let override_model = payload.override_model.trim().to_string();
 
     let conn = match open_db(&state.db_path) {
         Ok(conn) => conn,
@@ -3518,9 +3591,9 @@ async fn create_access_key(
     };
 
     let id = match conn.execute(
-        "INSERT INTO access_keys (name, access_key, proxy_id, created_at, updated_at)
-         VALUES (?1, ?2, ?3, strftime('%s', 'now'), strftime('%s', 'now'))",
-        params![name, access_key, payload.proxy_id],
+        "INSERT INTO access_keys (name, access_key, proxy_id, override_model, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, strftime('%s', 'now'), strftime('%s', 'now'))",
+        params![name, access_key, payload.proxy_id, override_model],
     ) {
         Ok(_) => conn.last_insert_rowid(),
         Err(err) => {
@@ -3546,6 +3619,7 @@ async fn update_access_key(
         Ok(name) => name,
         Err(err) => return json_error(StatusCode::BAD_REQUEST, err),
     };
+    let override_model = payload.override_model.trim().to_string();
 
     let conn = match open_db(&state.db_path) {
         Ok(conn) => conn,
@@ -3580,9 +3654,9 @@ async fn update_access_key(
 
     match conn.execute(
         "UPDATE access_keys
-         SET name = ?1, proxy_id = ?2, updated_at = strftime('%s', 'now')
-         WHERE id = ?3",
-        params![name, payload.proxy_id, id],
+         SET name = ?1, proxy_id = ?2, override_model = ?3, updated_at = strftime('%s', 'now')
+         WHERE id = ?4",
+        params![name, payload.proxy_id, override_model, id],
     ) {
         Ok(_) => {}
         Err(err) => {
@@ -4224,17 +4298,35 @@ async fn key_models(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
         Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     };
 
-    let upstream_url = match build_upstream_url(&target.base_url, MODELS_PATH, None) {
+    let models = match load_upstream_models(&state, &target.base_url, &target.api_key).await {
+        Ok(models) => models,
+        Err(response) => return response,
+    };
+    Json(KeyModelsResponse {
+        models,
+        selected_model: target.selected_model,
+        selected_protocol: target.selected_protocol,
+        supplier_protocol: target.supplier_protocol,
+    })
+    .into_response()
+}
+
+async fn load_upstream_models(
+    state: &AppState,
+    base_url: &str,
+    api_key: &str,
+) -> Result<Vec<String>, Response<Body>> {
+    let upstream_url = match build_upstream_url(base_url, MODELS_PATH, None) {
         Ok(url) => url,
-        Err(err) => return json_error(StatusCode::BAD_REQUEST, err),
+        Err(err) => return Err(json_error(StatusCode::BAD_REQUEST, err)),
     };
     let authority = match upstream_authority(&upstream_url) {
         Ok(authority) => authority,
-        Err(err) => return json_error(StatusCode::BAD_GATEWAY, err),
+        Err(err) => return Err(json_error(StatusCode::BAD_GATEWAY, err)),
     };
-    let headers = match build_upstream_headers(&HeaderMap::new(), &authority, &target.api_key) {
+    let headers = match build_upstream_headers(&HeaderMap::new(), &authority, api_key) {
         Ok(headers) => headers,
-        Err(err) => return json_error(StatusCode::BAD_GATEWAY, err),
+        Err(err) => return Err(json_error(StatusCode::BAD_GATEWAY, err)),
     };
 
     match state.client.get(upstream_url).headers(headers).send().await {
@@ -4242,30 +4334,79 @@ async fn key_models(State(state): State<AppState>, Path(id): Path<i64>) -> Respo
             let body = match response.bytes().await {
                 Ok(bytes) => bytes,
                 Err(err) => {
-                    return json_error(
+                    return Err(json_error(
                         StatusCode::BAD_GATEWAY,
                         format!("Failed to read upstream models response: {err}"),
-                    )
+                    ))
                 }
             };
-            let models = match parse_model_ids(&body) {
-                Ok(models) => models,
-                Err(err) => return json_error(StatusCode::BAD_GATEWAY, err),
-            };
-            Json(KeyModelsResponse {
-                models,
-                selected_model: target.selected_model,
-                selected_protocol: target.selected_protocol,
-                supplier_protocol: target.supplier_protocol,
-            })
-            .into_response()
+            parse_model_ids(&body).map_err(|err| json_error(StatusCode::BAD_GATEWAY, err))
         }
-        Ok(response) => json_error(
+        Ok(response) => Err(json_error(
             StatusCode::BAD_GATEWAY,
             format!("Failed to load models ({})", response.status().as_u16()),
-        ),
-        Err(err) if err.is_timeout() => json_error(StatusCode::BAD_GATEWAY, "加载模型超时"),
-        Err(err) => json_error(StatusCode::BAD_GATEWAY, format!("加载模型失败: {err}")),
+        )),
+        Err(err) if err.is_timeout() => Err(json_error(StatusCode::BAD_GATEWAY, "加载模型超时")),
+        Err(err) => Err(json_error(
+            StatusCode::BAD_GATEWAY,
+            format!("加载模型失败: {err}"),
+        )),
+    }
+}
+
+async fn supplier_models(State(state): State<AppState>, Path(id): Path<i64>) -> Response<Body> {
+    let conn = match open_db(&state.db_path) {
+        Ok(conn) => conn,
+        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+
+    let base_url: Option<String> = match conn
+        .query_row(
+            "SELECT base_url FROM pool_base_urls WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()
+    {
+        Ok(value) => value,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load supplier: {err}"),
+            )
+        }
+    };
+    let Some(base_url) = base_url else {
+        return json_error(StatusCode::NOT_FOUND, "supplier not found");
+    };
+
+    let api_key: Option<String> = match conn
+        .query_row(
+            "SELECT api_key
+             FROM pool_api_keys
+             WHERE base_url_id = ?1 AND manually_disabled = 0
+             ORDER BY sort_order ASC, id ASC
+             LIMIT 1",
+            params![id],
+            |row| row.get(0),
+        )
+        .optional()
+    {
+        Ok(value) => value,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load supplier api_key: {err}"),
+            )
+        }
+    };
+    let Some(api_key) = api_key else {
+        return json_error(StatusCode::BAD_REQUEST, "supplier has no available api_key");
+    };
+
+    match load_upstream_models(&state, &base_url, &api_key).await {
+        Ok(models) => Json(SupplierModelsResponse { models }).into_response(),
+        Err(response) => response,
     }
 }
 
@@ -4481,8 +4622,10 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
         };
         let mut bridge_context = transformed_request.bridge_context.clone();
         let upstream_body = transformed_request.body;
-        let upstream_body = if !base_url.override_model.is_empty() {
-            match override_model_in_body(&upstream_body, &base_url.override_model) {
+        let effective_override_model =
+            effective_override_model(&access_key, &base_url).map(ToOwned::to_owned);
+        let upstream_body = if let Some(model) = effective_override_model.as_deref() {
+            match override_model_in_body(&upstream_body, model) {
                 Ok(body) => body,
                 Err(err) => return json_error(StatusCode::BAD_REQUEST, err),
             }
@@ -4554,12 +4697,15 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                         }
                         mark_key_fail(&state, key.id, allow_auto_ban).await;
 
-                        if path == MODELS_PATH && !base_url.override_model.is_empty() {
+                        if let Some(model) = effective_override_model
+                            .as_deref()
+                            .filter(|_| path == MODELS_PATH)
+                        {
                             info!(
                                 "models fallback -> using override_model={} for supplier_id={}",
-                                base_url.override_model, base_url.id
+                                model, base_url.id
                             );
-                            return build_override_models_response(&base_url.override_model);
+                            return build_override_models_response(model);
                         }
 
                         last_error = Some(ProxyAttemptError {
@@ -4631,10 +4777,13 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                                         .into_response();
                                 }
                             };
-                            let body = match transform_response_body(&body, conversion, &bridge_context) {
-                                Ok(body) => body,
-                                Err(err) => return (StatusCode::BAD_GATEWAY, err).into_response(),
-                            };
+                            let body =
+                                match transform_response_body(&body, conversion, &bridge_context) {
+                                    Ok(body) => body,
+                                    Err(err) => {
+                                        return (StatusCode::BAD_GATEWAY, err).into_response()
+                                    }
+                                };
                             return downstream.body(Body::from(body)).unwrap_or_else(|err| {
                                 error!("Failed to build transformed upstream response: {err}");
                                 StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -4659,12 +4808,15 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                         }
                         mark_key_fail(&state, key.id, allow_auto_ban).await;
 
-                        if path == MODELS_PATH && !base_url.override_model.is_empty() {
+                        if let Some(model) = effective_override_model
+                            .as_deref()
+                            .filter(|_| path == MODELS_PATH)
+                        {
                             info!(
                                 "models fallback -> using override_model={} for supplier_id={} (timeout)",
-                                base_url.override_model, base_url.id
+                                model, base_url.id
                             );
-                            return build_override_models_response(&base_url.override_model);
+                            return build_override_models_response(model);
                         }
 
                         last_error = Some(ProxyAttemptError {
@@ -4692,12 +4844,15 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                         }
                         mark_key_fail(&state, key.id, allow_auto_ban).await;
 
-                        if path == MODELS_PATH && !base_url.override_model.is_empty() {
+                        if let Some(model) = effective_override_model
+                            .as_deref()
+                            .filter(|_| path == MODELS_PATH)
+                        {
                             info!(
                                 "models fallback -> using override_model={} for supplier_id={} (error)",
-                                base_url.override_model, base_url.id
+                                model, base_url.id
                             );
-                            return build_override_models_response(&base_url.override_model);
+                            return build_override_models_response(model);
                         }
 
                         last_error = Some(ProxyAttemptError {
@@ -4782,6 +4937,7 @@ async fn main() {
             "/admin/api/suppliers/{id}",
             put(update_base_url).delete(delete_base_url),
         )
+        .route("/admin/api/suppliers/{id}/models", get(supplier_models))
         .route("/admin/api/suppliers/{id}/keys", post(create_key))
         .route("/admin/api/pools", get(get_proxies).post(create_pool))
         .route(
@@ -5006,10 +5162,9 @@ mod tests {
             {"type":"custom","name":"run_shell","description":"Run shell"}
         ])));
 
-        let converted: Value = serde_json::from_slice(
-            &chat_response_to_responses(body, Some(&context)).unwrap(),
-        )
-        .unwrap();
+        let converted: Value =
+            serde_json::from_slice(&chat_response_to_responses(body, Some(&context)).unwrap())
+                .unwrap();
 
         assert_eq!(converted["output"][0]["type"], "custom_tool_call");
         assert_eq!(converted["output"][0]["name"], "run_shell");
@@ -5134,6 +5289,71 @@ mod tests {
         assert!(access_key[3..].chars().all(|ch| ch.is_ascii_hexdigit()));
     }
 
+    fn test_access_key_with_override(model: &str) -> AccessKeyConfig {
+        AccessKeyConfig {
+            id: 1,
+            name: "客户端 A".to_string(),
+            access_key: "me-1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd"
+                .to_string(),
+            proxy_id: 1,
+            override_model: model.to_string(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn test_base_url_with_override(model: &str) -> BaseUrlConfig {
+        BaseUrlConfig {
+            id: 1,
+            pool_id: 1,
+            name: "供应商 A".to_string(),
+            base_url: "https://api.example.com/v1".to_string(),
+            protocol_mode: ProtocolMode::Both,
+            override_model: model.to_string(),
+            sort_order: 0,
+            api_keys: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn access_key_override_model_takes_priority_over_supplier_model() {
+        let access_key = test_access_key_with_override("gpt-5.4");
+        let supplier = test_base_url_with_override("gpt-5.5");
+
+        assert_eq!(
+            effective_override_model(&access_key, &supplier),
+            Some("gpt-5.4")
+        );
+    }
+
+    #[test]
+    fn supplier_override_model_applies_when_access_key_model_is_empty() {
+        let access_key = test_access_key_with_override("");
+        let supplier = test_base_url_with_override("gpt-5.5");
+        let body = br#"{"model":"gpt-original","messages":[]}"#;
+
+        let model = effective_override_model(&access_key, &supplier).unwrap();
+        let converted: Value =
+            serde_json::from_slice(&override_model_in_body(body, model).unwrap()).unwrap();
+
+        assert_eq!(model, "gpt-5.5");
+        assert_eq!(converted["model"], "gpt-5.5");
+    }
+
+    #[tokio::test]
+    async fn override_models_response_uses_effective_access_key_model() {
+        let access_key = test_access_key_with_override("gpt-5.4");
+        let supplier = test_base_url_with_override("gpt-5.5");
+        let model = effective_override_model(&access_key, &supplier).unwrap();
+        let response = build_override_models_response(model);
+        let body = to_bytes(response.into_body(), MAX_REQUEST_BODY_BYTES)
+            .await
+            .unwrap();
+        let value: Value = serde_json::from_slice(&body).unwrap();
+
+        assert_eq!(value["data"][0]["id"], "gpt-5.4");
+    }
+
     #[test]
     fn init_database_supports_loading_access_keys() {
         let path = temp_db_path("access-keys");
@@ -5165,7 +5385,64 @@ mod tests {
         assert_eq!(access_keys.len(), 1);
         assert_eq!(access_keys[0].name, "客户端 A");
         assert_eq!(access_keys[0].proxy_id, 1);
+        assert_eq!(access_keys[0].override_model, "");
         assert!(access_keys[0].access_key.starts_with("me-"));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn create_and_update_access_key_save_override_model() {
+        let path = temp_db_path("access-key-override-save");
+        init_database(&path).unwrap();
+
+        let pool_id = {
+            let conn = open_db(&path).unwrap();
+            conn.execute(
+                "INSERT INTO pools (name, note, is_active, created_at, updated_at)
+                 VALUES ('测试代理', '', 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                [],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+
+        let state = test_app_state(&path);
+        let response = create_access_key(
+            State(state.clone()),
+            Json(AccessKeyPayload {
+                name: "客户端 A".to_string(),
+                proxy_id: pool_id,
+                override_model: "gpt-5.4".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let access_key_id: i64 = open_db(&path)
+            .unwrap()
+            .query_row(
+                "SELECT id FROM access_keys WHERE name = '客户端 A'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let response = update_access_key(
+            State(state.clone()),
+            Path(access_key_id),
+            Json(AccessKeyPayload {
+                name: "客户端 B".to_string(),
+                proxy_id: pool_id,
+                override_model: "gpt-5.5".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let access_keys = access_keys_response(&state).await;
+        assert_eq!(access_keys.access_keys[0].name, "客户端 B");
+        assert_eq!(access_keys.access_keys[0].override_model, "gpt-5.5");
 
         let _ = fs::remove_file(path);
     }
@@ -5274,8 +5551,8 @@ mod tests {
             .unwrap();
             let key_id = conn.last_insert_rowid();
             conn.execute(
-                "INSERT INTO access_keys (name, access_key, proxy_id, created_at, updated_at)
-                 VALUES ('客户端 A', 'me-1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd', ?1, strftime('%s', 'now'), strftime('%s', 'now'))",
+                "INSERT INTO access_keys (name, access_key, proxy_id, override_model, created_at, updated_at)
+                 VALUES ('客户端 A', 'me-1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd', ?1, 'gpt-5.4', strftime('%s', 'now'), strftime('%s', 'now'))",
                 params![pool_id],
             )
             .unwrap();
@@ -5325,8 +5602,8 @@ mod tests {
             .unwrap();
             let key_id = conn.last_insert_rowid();
             conn.execute(
-                "INSERT INTO access_keys (name, access_key, proxy_id, created_at, updated_at)
-                 VALUES ('客户端 A', 'me-1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd', ?1, strftime('%s', 'now'), strftime('%s', 'now'))",
+                "INSERT INTO access_keys (name, access_key, proxy_id, override_model, created_at, updated_at)
+                 VALUES ('客户端 A', 'me-1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd', ?1, 'gpt-5.4', strftime('%s', 'now'), strftime('%s', 'now'))",
                 params![pool_id],
             )
             .unwrap();
@@ -5339,6 +5616,8 @@ mod tests {
 
         let access_keys = access_keys_response(&state).await;
         assert_eq!(access_keys.access_keys.len(), 1);
+        assert_eq!(access_keys.access_keys[0].override_model, "gpt-5.4");
+        assert_eq!(access_keys.proxies[0].suppliers[0].id, supplier_id);
         assert_eq!(
             access_keys.access_keys[0]
                 .last_used_supplier_name
