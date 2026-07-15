@@ -178,7 +178,7 @@
 
     .key-grid {
       display: grid;
-      grid-template-columns: 180px minmax(0, 1fr) 190px 260px;
+      grid-template-columns: 180px minmax(0, 1fr) 190px minmax(180px, 260px);
       gap: 12px;
       align-items: start;
     }
@@ -212,17 +212,6 @@
     select:focus {
       border-color: #9ec5ff;
       box-shadow: 0 0 0 4px rgba(37, 99, 235, 0.08);
-    }
-
-    .model-override-row {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) 38px;
-      gap: 8px;
-    }
-
-    .model-override-row .button {
-      min-height: 40px;
-      padding: 0;
     }
 
     .key-value {
@@ -389,8 +378,6 @@
     }
 
     function mapAccessKey(item) {
-      const proxy = state.proxies.find(proxy => proxy.id === Number(item.proxy_id));
-      const firstSupplierId = proxy?.suppliers?.[0]?.id || '';
       return {
         localId: `saved-${item.id}`,
         id: item.id,
@@ -398,10 +385,7 @@
         accessKey: item.access_key,
         proxyId: item.proxy_id,
         proxyName: item.proxy_name,
-        selectedSupplierId: firstSupplierId,
         overrideModel: item.override_model || '',
-        overrideModels: [],
-        modelLoading: false,
         createdAt: item.created_at,
         updatedAt: item.updated_at,
         lastUsedSupplierName: item.last_used_supplier_name || '',
@@ -414,18 +398,6 @@
 
     function currentProxyName(proxyId) {
       return state.proxies.find(proxy => proxy.id === Number(proxyId))?.name || '';
-    }
-
-    function currentProxy(proxyId) {
-      return state.proxies.find(proxy => proxy.id === Number(proxyId)) || null;
-    }
-
-    function supplierOptionsForProxy(proxyId) {
-      return currentProxy(proxyId)?.suppliers || [];
-    }
-
-    function firstSupplierIdForProxy(proxyId) {
-      return supplierOptionsForProxy(proxyId)[0]?.id || '';
     }
 
     async function loadAccessKeys() {
@@ -456,10 +428,7 @@
         accessKey: '',
         proxyId: defaultProxy,
         proxyName: currentProxyName(defaultProxy),
-        selectedSupplierId: firstSupplierIdForProxy(defaultProxy),
         overrideModel: '',
-        overrideModels: [],
-        modelLoading: false,
         createdAt: null,
         updatedAt: null,
         saving: false,
@@ -552,36 +521,6 @@
       }
     }
 
-    async function loadSupplierModels(localId) {
-      const item = state.items.find(entry => entry.localId === localId);
-      if (!item) return;
-
-      if (!item.selectedSupplierId) {
-        item.error = '请选择模型来源渠道';
-        render();
-        return;
-      }
-
-      item.modelLoading = true;
-      item.error = '';
-      render();
-
-      try {
-        const result = await apiRequest(`/admin/api/suppliers/${item.selectedSupplierId}/models`);
-        const selectedModel = (item.overrideModel || '').trim();
-        const upstreamModels = result.models || [];
-        item.overrideModels = [
-          ...(selectedModel && !upstreamModels.includes(selectedModel) ? [selectedModel] : []),
-          ...upstreamModels
-        ];
-      } catch (error) {
-        item.error = error.message || '获取模型列表失败';
-      } finally {
-        item.modelLoading = false;
-        render();
-      }
-    }
-
     function renderSummary() {
       const boundProxyIds = new Set(state.items.filter(item => item.proxyId).map(item => Number(item.proxyId)));
       summary.innerHTML = `
@@ -589,22 +528,6 @@
         <div class="chip">已接入代理 ${boundProxyIds.size} 个</div>
         <div class="chip">可绑定代理 ${state.proxies.length} 个</div>
       `;
-    }
-
-    function renderSupplierOptions(item) {
-      const suppliers = supplierOptionsForProxy(item.proxyId);
-      return suppliers.map(supplier => {
-        const label = supplier.name && supplier.name.trim()
-          ? supplier.name
-          : supplier.base_url || `渠道 #${supplier.id}`;
-        return `<option value="${supplier.id}" ${Number(item.selectedSupplierId) === supplier.id ? 'selected' : ''}>${escapeHtml(label)}</option>`;
-      }).join('');
-    }
-
-    function renderOverrideModelOptions(item) {
-      return (item.overrideModels || [])
-        .map(model => `<option value="${escapeAttr(model)}"></option>`)
-        .join('');
     }
 
     function renderList() {
@@ -642,33 +565,13 @@
               </select>
             </div>
             <div class="field">
-              <label>模型来源渠道</label>
-              <select data-input="supplier" data-local-id="${item.localId}" ${!item.proxyId ? 'disabled' : ''}>
-                <option value="">请选择渠道</option>
-                ${renderSupplierOptions(item)}
-              </select>
-            </div>
-            <div class="field">
               <label>强制模型</label>
-              <div class="model-override-row">
-                <input
-                  list="access-key-models-${item.localId}"
-                  value="${escapeAttr(item.overrideModel || '')}"
-                  placeholder="可选"
-                  data-input="override-model"
-                  data-local-id="${item.localId}"
-                />
-                <datalist id="access-key-models-${item.localId}">
-                  ${renderOverrideModelOptions(item)}
-                </datalist>
-                <button
-                  class="button light"
-                  title="获取模型列表"
-                  data-action="load-models"
-                  data-local-id="${item.localId}"
-                  ${item.modelLoading || !item.selectedSupplierId ? 'disabled' : ''}
-                >${item.modelLoading ? '...' : '&#x21bb;'}</button>
-              </div>
+              <input
+                value="${escapeAttr(item.overrideModel || '')}"
+                placeholder="手动填写模型，可选"
+                data-input="override-model"
+                data-local-id="${item.localId}"
+              />
             </div>
           </div>
           <div class="meta">
@@ -727,18 +630,9 @@
       if (inputType === 'proxy') {
         item.proxyId = target.value;
         item.proxyName = currentProxyName(target.value);
-        item.selectedSupplierId = firstSupplierIdForProxy(target.value);
-        item.overrideModel = '';
-        item.overrideModels = [];
         item.error = '';
         render();
         return;
-      }
-
-      if (inputType === 'supplier') {
-        item.selectedSupplierId = target.value;
-        item.overrideModels = [];
-        item.error = '';
       }
 
       render();
@@ -769,9 +663,6 @@
         return;
       }
 
-      if (button.dataset.action === 'load-models') {
-        loadSupplierModels(localId);
-      }
     });
 
     loadAccessKeys();
