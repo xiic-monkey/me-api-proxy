@@ -531,23 +531,6 @@
       min-width: 0;
     }
 
-    .model-override-row {
-      display: flex;
-      gap: 4px;
-      align-items: stretch;
-    }
-
-    .model-override-row input {
-      flex: 1;
-      min-width: 0;
-    }
-
-    .icon-btn {
-      flex: 0 0 auto;
-      padding: 10px;
-      line-height: 1;
-    }
-
     .field label {
       color: var(--muted);
       font-size: 12px;
@@ -580,6 +563,53 @@
       display: grid;
       gap: 10px;
       min-width: 0;
+    }
+
+    .key-groups {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      min-width: 0;
+      align-items: start;
+    }
+
+    .key-group {
+      display: grid;
+      gap: 10px;
+      min-width: 0;
+      align-content: start;
+      padding: 12px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+    }
+
+    .key-group.image {
+      background: #f8fcfb;
+      border-color: #cce9db;
+    }
+
+    .key-group-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      min-width: 0;
+    }
+
+    .key-group-title {
+      display: grid;
+      gap: 2px;
+      min-width: 0;
+    }
+
+    .key-group-title strong {
+      font-size: 13px;
+    }
+
+    .key-group-title span {
+      color: var(--muted);
+      font-size: 12px;
     }
 
     .base-card {
@@ -935,7 +965,8 @@
 
     @media (max-width: 820px) {
       .field-grid,
-      .key-row {
+      .key-row,
+      .key-groups {
         grid-template-columns: 1fr;
       }
 
@@ -952,6 +983,12 @@
 
       .editor-toolbar {
         grid-template-columns: 1fr;
+      }
+
+      .summary-main,
+      .summary-side {
+        width: 100%;
+        flex: 0 0 auto;
       }
 
       .pool-actions {
@@ -1175,8 +1212,10 @@
       return currentEditablePool()?.baseUrls.find(item => item.localId === baseLocalId) || null;
     }
 
-    function findDraftKey(baseLocalId, keyLocalId) {
-      return findDraftBase(baseLocalId)?.keys.find(item => item.localId === keyLocalId) || null;
+    function findDraftKey(baseLocalId, keyLocalId, keyType = 'chat') {
+      const base = findDraftBase(baseLocalId);
+      const keys = keyType === 'image' ? base?.imageKeys : base?.keys;
+      return keys?.find(item => item.localId === keyLocalId) || null;
     }
 
     function isBaseExpanded(baseLocalId) {
@@ -1304,6 +1343,9 @@
           for (const key of base.keys || []) {
             used.add(key.localId);
           }
+          for (const key of base.imageKeys || []) {
+            used.add(key.localId);
+          }
         }
       }
 
@@ -1313,6 +1355,9 @@
         for (const base of draftPool.baseUrls || []) {
           used.add(base.localId);
           for (const key of base.keys || []) {
+            used.add(key.localId);
+          }
+          for (const key of base.imageKeys || []) {
             used.add(key.localId);
           }
         }
@@ -1326,7 +1371,8 @@
       while (
         used.has(`proxy-${state.nextLocalId}`) ||
         used.has(`supplier-${state.nextLocalId}`) ||
-        used.has(`key-${state.nextLocalId}`)
+        used.has(`key-${state.nextLocalId}`) ||
+        used.has(`image-key-${state.nextLocalId}`)
       ) {
         state.nextLocalId += 1;
       }
@@ -1369,20 +1415,20 @@
       return escapeHtml(value).replaceAll("'", '&#39;');
     }
 
-    function mapKeyFromApi(key) {
+    function mapKeyFromApi(key, type = 'chat') {
       return {
-        localId: `key-${key.id}`,
+        localId: `${type === 'image' ? 'image-key' : 'key'}-${key.id}`,
         id: key.id,
         value: key.api_key,
         manuallyDisabled: key.manually_disabled,
-        testModel: key.test_model || '',
-        testProtocol: key.test_protocol || '',
+        testModel: type === 'chat' ? key.test_model || '' : '',
+        testProtocol: type === 'chat' ? key.test_protocol || '' : '',
         failCount: key.fail_count,
         banned: key.banned,
         banUntil: key.ban_until,
-        lastUsed: !!key.last_used,
-        lastUsedAt: key.last_used_at || null,
-        lastUsedByAccessKeyName: key.last_used_by_access_key_name || ''
+        lastUsed: type === 'chat' && !!key.last_used,
+        lastUsedAt: type === 'chat' ? key.last_used_at || null : null,
+        lastUsedByAccessKeyName: type === 'chat' ? key.last_used_by_access_key_name || '' : ''
       };
     }
 
@@ -1394,10 +1440,10 @@
         protocol: supplier.protocol,
         url: supplier.base_url,
         overrideModel: supplier.override_model || '',
-        overrideModels: [],
         lastUsedAt: supplier.last_used_at || null,
         lastUsedByAccessKeyName: supplier.last_used_by_access_key_name || '',
-        keys: supplier.keys.map(mapKeyFromApi)
+        keys: supplier.keys.map(key => mapKeyFromApi(key, 'chat')),
+        imageKeys: (supplier.image_keys || []).map(key => mapKeyFromApi(key, 'image'))
       };
     }
 
@@ -1460,10 +1506,12 @@
     }
 
     function keyTagText(key) {
+      if (!key.id && !key.value.trim()) return '待保存';
       return key.manuallyDisabled ? '停用' : '启用中';
     }
 
     function keyTagClass(key) {
+      if (!key.id && !key.value.trim()) return 'idle';
       return key.manuallyDisabled ? 'idle' : 'active';
     }
 
@@ -1755,8 +1803,8 @@
         protocol: 'both',
         url: '',
         overrideModel: '',
-        overrideModels: [],
-        keys: []
+        keys: [],
+        imageKeys: []
       };
       pool.baseUrls.push(base);
       setBaseExpanded(base.localId, true);
@@ -1764,15 +1812,16 @@
       render();
     }
 
-    function addKey(poolLocalId, baseLocalId) {
+    function addKey(poolLocalId, baseLocalId, keyType = 'chat') {
       const pool = currentEditablePool();
       if (!pool || pool.localId !== poolLocalId) return;
       const base = findDraftBase(baseLocalId);
       if (!base) return;
 
       ensureNextLocalIdAvailable();
-      base.keys.push({
-        localId: nextLocalId('key'),
+      const keys = keyType === 'image' ? base.imageKeys : base.keys;
+      keys.push({
+        localId: nextLocalId(keyType === 'image' ? 'image-key' : 'key'),
         id: null,
         value: '',
         manuallyDisabled: false,
@@ -1796,12 +1845,16 @@
       render();
     }
 
-    function removeKey(poolLocalId, baseLocalId, keyLocalId) {
+    function removeKey(poolLocalId, baseLocalId, keyLocalId, keyType = 'chat') {
       const pool = currentEditablePool();
       if (!pool || pool.localId !== poolLocalId) return;
       const base = findDraftBase(baseLocalId);
       if (!base) return;
-      base.keys = base.keys.filter(item => item.localId !== keyLocalId);
+      if (keyType === 'image') {
+        base.imageKeys = base.imageKeys.filter(item => item.localId !== keyLocalId);
+      } else {
+        base.keys = base.keys.filter(item => item.localId !== keyLocalId);
+      }
       markDirty();
       render();
     }
@@ -1834,16 +1887,18 @@
         }
         seenBaseUrls.add(normalizedBaseUrl);
 
-        const seenKeys = new Set();
-        for (const key of base.keys) {
-          const apiKey = key.value.trim();
-          if (!apiKey) {
-            return 'API Key 不能为空';
+        for (const [label, keys] of [['聊天', base.keys], ['生图', base.imageKeys]]) {
+          const seenKeys = new Set();
+          for (const key of keys) {
+            const apiKey = key.value.trim();
+            if (!apiKey) {
+              return `${label} API Key 不能为空`;
+            }
+            if (seenKeys.has(apiKey)) {
+              return `同一个供应商中不能重复填写${label} API Key`;
+            }
+            seenKeys.add(apiKey);
           }
-          if (seenKeys.has(apiKey)) {
-            return '同一个供应商中不能重复填写 API Key';
-          }
-          seenKeys.add(apiKey);
         }
       }
 
@@ -1861,6 +1916,10 @@
           protocol: base.protocol,
           override_model: (base.overrideModel || '').trim(),
           keys: base.keys.map(key => ({
+            ...(key.id ? { id: key.id } : {}),
+            api_key: key.value.trim()
+          })),
+          image_keys: base.imageKeys.map(key => ({
             ...(key.id ? { id: key.id } : {}),
             api_key: key.value.trim()
           }))
@@ -1943,7 +2002,7 @@
       }
     }
 
-    async function runKeyAction(action, keyId) {
+    async function runKeyAction(action, keyId, keyType = 'chat') {
       if (hasUnsavedChanges()) {
         state.saveState = 'error';
         state.errorMessage = '请先保存当前改动';
@@ -1951,11 +2010,12 @@
         return;
       }
 
+      const resource = keyType === 'image' ? 'image-keys' : 'keys';
       const path = action === 'disable-key'
-        ? `/admin/api/keys/${keyId}/disable`
+        ? `/admin/api/${resource}/${keyId}/disable`
         : action === 'enable-key'
-          ? `/admin/api/keys/${keyId}/enable`
-          : `/admin/api/keys/${keyId}/unban`;
+          ? `/admin/api/${resource}/${keyId}/enable`
+          : `/admin/api/${resource}/${keyId}/unban`;
 
       try {
         await apiRequest(path, { method: 'POST' });
@@ -2013,38 +2073,6 @@
       openTestModalSkeleton(key, base);
       render();
       await loadTestModels();
-    }
-
-    async function loadSupplierModels(baseLocalId) {
-      const pool = currentEditablePool();
-      if (!pool) return;
-      const base = pool.baseUrls.find(b => b.localId === baseLocalId);
-      if (!base) return;
-
-      const firstKeyWithId = base.keys.find(k => k.id);
-      if (!firstKeyWithId) {
-        alert('请先保存后再获取模型列表');
-        return;
-      }
-
-      const btn = document.querySelector(`[data-action="load-supplier-models"][data-base-local-id="${baseLocalId}"]`);
-      if (btn) {
-        btn.disabled = true;
-        btn.textContent = '...';
-      }
-
-      try {
-        const result = await apiRequest(`/admin/api/keys/${firstKeyWithId.id}/models`);
-        base.overrideModels = result.models || [];
-        render();
-      } catch (error) {
-        alert('获取模型列表失败: ' + (error.message || '未知错误'));
-      } finally {
-        if (btn) {
-          btn.disabled = false;
-          btn.innerHTML = '&#x21bb;';
-        }
-      }
     }
 
     async function submitKeyTest() {
@@ -2208,7 +2236,8 @@
 
       poolList.innerHTML = state.pools.map(pool => {
         const baseUrlCount = pool.baseUrls.length;
-        const keyCount = pool.baseUrls.reduce((sum, item) => sum + item.keys.length, 0);
+        const chatKeyCount = pool.baseUrls.reduce((sum, item) => sum + item.keys.length, 0);
+        const imageKeyCount = pool.baseUrls.reduce((sum, item) => sum + item.imageKeys.length, 0);
         const dragging = state.draggingPoolLocalId === pool.localId;
         const dragOverPosition = state.dragOverPoolLocalId === pool.localId ? state.dragOverPoolPosition : null;
         const cardClasses = [
@@ -2237,7 +2266,7 @@
             </div>
 
             <div class="pool-foot">
-              <div class="pool-desc">供应商 ${baseUrlCount} 个 · Key ${keyCount} 个 · 接入 Key ${pool.accessKeyCount} 个</div>
+              <div class="pool-desc">供应商 ${baseUrlCount} 个 · 聊天 Key ${chatKeyCount} 个 · 生图 Key ${imageKeyCount} 个 · 接入 Key ${pool.accessKeyCount} 个</div>
             </div>
           </article>
         `;
@@ -2268,7 +2297,8 @@
         return;
       }
 
-      const totalKeys = pool.baseUrls.reduce((sum, item) => sum + item.keys.length, 0);
+      const totalChatKeys = pool.baseUrls.reduce((sum, item) => sum + item.keys.length, 0);
+      const totalImageKeys = pool.baseUrls.reduce((sum, item) => sum + item.imageKeys.length, 0);
 
       editorTitle.textContent = `${pool.name} · 编辑`;
       editorSub.textContent = pool.id
@@ -2295,7 +2325,8 @@
                   <span class="summary-chip">${pool.inUse ? '使用中' : '未接入'}</span>
                   <span class="summary-chip">接入 Key ${pool.accessKeyCount} 个</span>
                   <span class="summary-chip">供应商 ${pool.baseUrls.length} 个</span>
-                  <span class="summary-chip">Key ${totalKeys} 个</span>
+                  <span class="summary-chip">聊天 Key ${totalChatKeys} 个</span>
+                  <span class="summary-chip">生图 Key ${totalImageKeys} 个</span>
                 </div>
                 <div class="summary-actions">
                   ${pool.id ? '<button class="button danger" data-action="delete-pool" data-local-id="' + pool.localId + '">删除代理</button>' : ''}
@@ -2339,7 +2370,10 @@
         dragging ? 'dragging' : '',
         dragOverPosition ? `drag-over-${dragOverPosition}` : ''
       ].filter(Boolean).join(' ');
-      const keyCountText = `Key ${base.keys.length} 个`;
+      const keyCountText = `聊天 Key ${base.keys.length} 个`;
+      const imageKeyCountText = base.imageKeys.length
+        ? `生图 Key ${base.imageKeys.length} 个`
+        : '生图复用聊天 Key';
       const usageText = supplierUsageText(base);
 
       return `
@@ -2356,6 +2390,7 @@
                   <h4>${escapeHtml(baseTitle(base))}</h4>
                   <span class="tag idle">${escapeHtml(protocolLabel(base.protocol))}</span>
                   <span class="summary-chip">${keyCountText}</span>
+                  <span class="summary-chip">${imageKeyCountText}</span>
                   ${usageText ? '<span class="summary-chip">最近命中</span>' : ''}
                 </div>
                 <div class="base-url-summary">${escapeHtml(baseUrlSummary(base))}</div>
@@ -2364,7 +2399,6 @@
             </div>
             <div class="base-card-actions">
               <button class="button light" data-action="toggle-base" data-base-local-id="${base.localId}">${expanded ? '收起' : '展开'}</button>
-              <button class="button light" data-action="add-key" data-local-id="${pool.localId}" data-base-local-id="${base.localId}">+ 新增 Key</button>
               <button class="button danger" data-action="remove-base-url" data-local-id="${pool.localId}" data-base-local-id="${base.localId}">删除</button>
             </div>
           </div>
@@ -2382,24 +2416,12 @@
               </div>
               <div class="field">
                 <label>强制模型</label>
-                <div class="model-override-row">
-                  <input
-                    list="supplier-models-${base.localId}"
-                    value="${escapeAttr(base.overrideModel || '')}"
-                    placeholder="可选"
-                    data-input="base-override-model"
-                    data-base-local-id="${base.localId}"
-                  />
-                  <datalist id="supplier-models-${base.localId}">
-                    ${(base.overrideModels || []).map(m => `<option value="${escapeAttr(m)}"></option>`).join('')}
-                  </datalist>
-                  <button
-                    class="button light icon-btn"
-                    title="获取模型列表"
-                    data-action="load-supplier-models"
-                    data-base-local-id="${base.localId}"
-                  >&#x21bb;</button>
-                </div>
+                <input
+                  value="${escapeAttr(base.overrideModel || '')}"
+                  placeholder="手动填写模型，可选"
+                  data-input="base-override-model"
+                  data-base-local-id="${base.localId}"
+                />
               </div>
             </div>
 
@@ -2423,8 +2445,31 @@
               </div>
             </div>
 
-            <div class="key-list">
-              ${base.keys.length ? base.keys.map(key => renderKeyRow(pool.localId, base.localId, key)).join('') : '<div class="empty">这个供应商还没有 Key。</div>'}
+            <div class="key-groups">
+              <section class="key-group">
+                <div class="key-group-head">
+                  <div class="key-group-title">
+                    <strong>聊天 Key</strong>
+                    <span>用于 Chat 和 Responses 请求</span>
+                  </div>
+                  <button class="button light" data-action="add-key" data-local-id="${pool.localId}" data-base-local-id="${base.localId}">+ 新增</button>
+                </div>
+                <div class="key-list">
+                  ${base.keys.length ? base.keys.map(key => renderKeyRow(pool.localId, base.localId, key, 'chat')).join('') : '<div class="empty">未配置聊天 Key。</div>'}
+                </div>
+              </section>
+              <section class="key-group image">
+                <div class="key-group-head">
+                  <div class="key-group-title">
+                    <strong>生图 Key</strong>
+                    <span>${base.imageKeys.length ? '用于 /v1/images/generations 请求' : '未配置时自动复用聊天 Key'}</span>
+                  </div>
+                  <button class="button light" data-action="add-image-key" data-local-id="${pool.localId}" data-base-local-id="${base.localId}">+ 新增</button>
+                </div>
+                <div class="key-list">
+                  ${base.imageKeys.length ? base.imageKeys.map(key => renderKeyRow(pool.localId, base.localId, key, 'image')).join('') : '<div class="empty">未配置，生图将使用聊天 Key。</div>'}
+                </div>
+              </section>
             </div>
           </div>
           ` : ''}
@@ -2432,20 +2477,20 @@
       `;
     }
 
-    function renderKeyRow(poolLocalId, baseLocalId, key) {
+    function renderKeyRow(poolLocalId, baseLocalId, key, keyType) {
       const primaryAction = key.id
         ? (key.manuallyDisabled
-          ? `<button class="button light" data-action="enable-key" data-key-id="${key.id}">开启</button>`
-          : `<button class="button light" data-action="disable-key" data-key-id="${key.id}">禁用</button>`)
+          ? `<button class="button light" data-action="enable-key" data-key-id="${key.id}" data-key-type="${keyType}">开启</button>`
+          : `<button class="button light" data-action="disable-key" data-key-id="${key.id}" data-key-type="${keyType}">禁用</button>`)
         : '';
       const unbanAction = key.id && key.banned && !key.manuallyDisabled
-        ? `<button class="button light" data-action="unban-key" data-key-id="${key.id}">解禁</button>`
+        ? `<button class="button light" data-action="unban-key" data-key-id="${key.id}" data-key-type="${keyType}">解禁</button>`
         : '';
-      const testAction = key.id
+      const testAction = keyType === 'chat' && key.id
         ? `<button class="button light" data-action="test-key" data-key-id="${key.id}" data-key-local-id="${key.localId}">测试</button>`
-        : '<button class="button light" disabled>测试</button>';
-      const testMessage = keyTestMessage(key);
-      const usageText = keyLastUsedText(key);
+        : keyType === 'chat' ? '<button class="button light" disabled>测试</button>' : '';
+      const testMessage = keyType === 'chat' ? keyTestMessage(key) : '';
+      const usageText = keyType === 'chat' ? keyLastUsedText(key) : '';
       const statusParts = [keyStatusText(key)];
       if (usageText) statusParts.push(usageText);
       if (testMessage) statusParts.push(testMessage);
@@ -2457,12 +2502,13 @@
             <input
               class="key-input"
               value="${escapeAttr(key.value || '')}"
-              placeholder="填写 API Key"
+              placeholder="填写${keyType === 'image' ? '生图' : '聊天'} API Key"
               autocomplete="new-password"
               spellcheck="false"
               data-input="key-value"
               data-base-local-id="${baseLocalId}"
               data-key-local-id="${key.localId}"
+              data-key-type="${keyType}"
             />
           </div>
           <div class="key-foot">
@@ -2472,7 +2518,7 @@
               ${testAction}
               ${primaryAction}
               ${unbanAction}
-              <button class="button danger" data-action="remove-key" data-local-id="${poolLocalId}" data-base-local-id="${baseLocalId}" data-key-local-id="${key.localId}">删除</button>
+              <button class="button danger" data-action="remove-key" data-local-id="${poolLocalId}" data-base-local-id="${baseLocalId}" data-key-local-id="${key.localId}" data-key-type="${keyType}">删除</button>
             </div>
           </div>
         </div>
@@ -2534,7 +2580,11 @@
       }
 
       if (inputType === 'key-value') {
-        const key = findDraftKey(target.dataset.baseLocalId, target.dataset.keyLocalId);
+        const key = findDraftKey(
+          target.dataset.baseLocalId,
+          target.dataset.keyLocalId,
+          target.dataset.keyType || 'chat'
+        );
         if (!key) return;
         key.value = target.value;
         markDirty();
@@ -2578,7 +2628,7 @@
       const button = event.target.closest('[data-action]');
       if (!button) return;
 
-      const { action, localId, baseLocalId, keyLocalId, keyId } = button.dataset;
+      const { action, localId, baseLocalId, keyLocalId, keyId, keyType = 'chat' } = button.dataset;
 
       if (action === 'edit') {
         selectPool(localId);
@@ -2607,7 +2657,12 @@
       }
 
       if (action === 'add-key') {
-        addKey(localId, baseLocalId);
+        addKey(localId, baseLocalId, 'chat');
+        return;
+      }
+
+      if (action === 'add-image-key') {
+        addKey(localId, baseLocalId, 'image');
         return;
       }
 
@@ -2617,12 +2672,7 @@
       }
 
       if (action === 'remove-key') {
-        removeKey(localId, baseLocalId, keyLocalId);
-        return;
-      }
-
-      if (action === 'load-supplier-models') {
-        loadSupplierModels(baseLocalId);
+        removeKey(localId, baseLocalId, keyLocalId, keyType);
         return;
       }
 
@@ -2651,7 +2701,7 @@
       }
 
       if (action === 'disable-key' || action === 'enable-key' || action === 'unban-key') {
-        runKeyAction(action, Number(keyId));
+        runKeyAction(action, Number(keyId), keyType);
       }
     });
 

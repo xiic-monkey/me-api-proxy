@@ -31,6 +31,7 @@ const MAX_REQUEST_BODY_BYTES: usize = 20 * 1024 * 1024;
 const CHAT_PATH: &str = "/v1/chat/completions";
 const RESPONSES_PATH: &str = "/v1/responses";
 const MODELS_PATH: &str = "/v1/models";
+const IMAGES_GENERATIONS_PATH: &str = "/v1/images/generations";
 const TEMP_BAN_FAILS: u32 = 3;
 const TEMP_BAN_MINUTES: i64 = 5;
 const DAILY_BAN_FAILS: u32 = 5;
@@ -215,6 +216,7 @@ struct BaseUrlConfig {
     override_model: String,
     sort_order: i64,
     api_keys: Vec<ApiKeyConfig>,
+    image_keys: Vec<ApiKeyConfig>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -249,6 +251,7 @@ struct ApiKeyRuntime {
 struct KeyRuntimeState {
     last_reset_date: chrono::NaiveDate,
     keys: HashMap<i64, ApiKeyRuntime>,
+    image_keys: HashMap<i64, ApiKeyRuntime>,
 }
 
 impl Default for KeyRuntimeState {
@@ -256,6 +259,7 @@ impl Default for KeyRuntimeState {
         Self {
             last_reset_date: Local::now().date_naive(),
             keys: HashMap::new(),
+            image_keys: HashMap::new(),
         }
     }
 }
@@ -372,6 +376,8 @@ struct SupplierSavePayload {
     override_model: String,
     #[serde(default)]
     keys: Vec<ApiKeySavePayload>,
+    #[serde(default)]
+    image_keys: Vec<ApiKeySavePayload>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -395,6 +401,7 @@ struct PreparedSupplierSave {
     protocol: ProtocolMode,
     override_model: String,
     keys: Vec<PreparedApiKeySave>,
+    image_keys: Vec<PreparedApiKeySave>,
 }
 
 #[derive(Debug)]
@@ -445,6 +452,7 @@ struct SupplierView {
     last_used_at: Option<i64>,
     last_used_by_access_key_name: Option<String>,
     keys: Vec<ApiKeyView>,
+    image_keys: Vec<ApiKeyView>,
 }
 
 #[derive(Debug, Serialize)]
@@ -630,6 +638,17 @@ fn init_database(path: &PathBuf) -> Result<(), String> {
             FOREIGN KEY (base_url_id) REFERENCES pool_base_urls(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS pool_image_keys (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            base_url_id INTEGER NOT NULL,
+            api_key TEXT NOT NULL,
+            sort_order INTEGER NOT NULL DEFAULT 0,
+            manually_disabled INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
+            FOREIGN KEY (base_url_id) REFERENCES pool_base_urls(id) ON DELETE CASCADE
+        );
+
         CREATE TABLE IF NOT EXISTS access_keys (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
@@ -804,18 +823,8 @@ fn prepare_proxy_save_payload(payload: ProxySavePayload) -> Result<PreparedProxy
             return Err("base_url already exists in proxy".to_string());
         }
 
-        let mut seen_api_keys = HashSet::new();
-        let mut keys = Vec::with_capacity(supplier.keys.len());
-        for key in supplier.keys {
-            let api_key = normalize_api_key(&key.api_key)?;
-            if !seen_api_keys.insert(api_key.clone()) {
-                return Err("api_key already exists in supplier".to_string());
-            }
-            keys.push(PreparedApiKeySave {
-                id: key.id,
-                api_key,
-            });
-        }
+        let keys = prepare_api_key_saves(supplier.keys)?;
+        let image_keys = prepare_api_key_saves(supplier.image_keys)?;
 
         suppliers.push(PreparedSupplierSave {
             id: supplier.id,
@@ -824,6 +833,7 @@ fn prepare_proxy_save_payload(payload: ProxySavePayload) -> Result<PreparedProxy
             protocol: supplier.protocol,
             override_model: supplier.override_model,
             keys,
+            image_keys,
         });
     }
 
@@ -832,6 +842,22 @@ fn prepare_proxy_save_payload(payload: ProxySavePayload) -> Result<PreparedProxy
         note,
         suppliers,
     })
+}
+
+fn prepare_api_key_saves(keys: Vec<ApiKeySavePayload>) -> Result<Vec<PreparedApiKeySave>, String> {
+    let mut seen_api_keys = HashSet::new();
+    let mut prepared_keys = Vec::with_capacity(keys.len());
+    for key in keys {
+        let api_key = normalize_api_key(&key.api_key)?;
+        if !seen_api_keys.insert(api_key.clone()) {
+            return Err("api_key already exists in supplier".to_string());
+        }
+        prepared_keys.push(PreparedApiKeySave {
+            id: key.id,
+            api_key,
+        });
+    }
+    Ok(prepared_keys)
 }
 
 fn normalize_legacy_api_keys(api_keys: Vec<String>) -> Vec<String> {
@@ -1234,6 +1260,33 @@ fn load_pools(path: &PathBuf) -> Result<Vec<PoolConfig>, String> {
                     .push(key_row.map_err(|err| format!("Failed to decode api_key row: {err}"))?);
             }
 
+            let mut image_key_stmt = conn
+                .prepare(
+                    "SELECT id, api_key, sort_order, manually_disabled
+                     FROM pool_image_keys
+                     WHERE base_url_id = ?1
+                     ORDER BY sort_order ASC, id ASC",
+                )
+                .map_err(|err| format!("Failed to prepare image key query: {err}"))?;
+            let image_key_rows = image_key_stmt
+                .query_map(params![base_url_id], |row| {
+                    Ok(ApiKeyConfig {
+                        id: row.get(0)?,
+                        base_url_id,
+                        api_key: row.get(1)?,
+                        sort_order: row.get(2)?,
+                        manually_disabled: row.get::<_, i64>(3)? != 0,
+                        test_model: String::new(),
+                        test_protocol: None,
+                    })
+                })
+                .map_err(|err| format!("Failed to query image keys: {err}"))?;
+            let mut image_keys = Vec::new();
+            for key_row in image_key_rows {
+                image_keys
+                    .push(key_row.map_err(|err| format!("Failed to decode image key row: {err}"))?);
+            }
+
             base_urls.push(BaseUrlConfig {
                 id: base_url_id,
                 pool_id,
@@ -1243,6 +1296,7 @@ fn load_pools(path: &PathBuf) -> Result<Vec<PoolConfig>, String> {
                 override_model,
                 sort_order,
                 api_keys,
+                image_keys,
             });
         }
 
@@ -1295,12 +1349,20 @@ async fn reload_pools(state: &AppState) -> Result<(), String> {
         .flat_map(|pool| pool.base_urls.iter())
         .flat_map(|base_url| base_url.api_keys.iter().map(|key| key.id))
         .collect();
+    let valid_image_key_ids: HashSet<i64> = pools
+        .iter()
+        .flat_map(|pool| pool.base_urls.iter())
+        .flat_map(|base_url| base_url.image_keys.iter().map(|key| key.id))
+        .collect();
 
     {
         let mut runtime = state.runtime.write().await;
         runtime
             .keys
             .retain(|key_id, _| valid_key_ids.contains(key_id));
+        runtime
+            .image_keys
+            .retain(|key_id, _| valid_image_key_ids.contains(key_id));
     }
     *state.pools.write().await = pools;
     reconcile_usage_runtime(state).await;
@@ -2717,6 +2779,7 @@ fn ensure_runtime_day(state: &mut KeyRuntimeState, now: DateTime<Local>) {
     let today = now.date_naive();
     if state.last_reset_date != today {
         state.keys.clear();
+        state.image_keys.clear();
         state.last_reset_date = today;
     }
 }
@@ -2752,6 +2815,31 @@ fn key_availability_in_state(
     }
 }
 
+fn image_key_availability_in_state(
+    key: &ApiKeyConfig,
+    state: &mut KeyRuntimeState,
+    now: DateTime<Local>,
+) -> KeyAvailability {
+    ensure_runtime_day(state, now);
+    let mut fail_count = 0;
+    let mut banned = false;
+    let mut ban_until = None;
+
+    if let Some(entry) = state.image_keys.get_mut(&key.id) {
+        clear_expired_ban(entry, now);
+        fail_count = entry.fail_count;
+        ban_until = entry.ban_until.map(|until| until.timestamp());
+        banned = entry.ban_until.map(|until| until > now).unwrap_or(false);
+    }
+
+    KeyAvailability {
+        fail_count,
+        banned,
+        ban_until,
+        schedulable: !key.manually_disabled && !banned,
+    }
+}
+
 fn pool_has_single_supplier_and_key(pool: &PoolConfig) -> bool {
     pool.base_urls.len() == 1
         && pool
@@ -2759,6 +2847,20 @@ fn pool_has_single_supplier_and_key(pool: &PoolConfig) -> bool {
             .first()
             .map(|base_url| base_url.api_keys.len() == 1)
             .unwrap_or(false)
+}
+
+fn image_request_has_single_candidate(pool: &PoolConfig) -> bool {
+    pool.base_urls
+        .iter()
+        .map(|base_url| {
+            if base_url.image_keys.is_empty() {
+                base_url.api_keys.len()
+            } else {
+                base_url.image_keys.len()
+            }
+        })
+        .sum::<usize>()
+        == 1
 }
 
 fn mark_key_fail_in_state(
@@ -2785,6 +2887,30 @@ fn mark_key_success_in_state(key_id: i64, state: &mut KeyRuntimeState, now: Date
     state.keys.remove(&key_id);
 }
 
+fn mark_image_key_fail_in_state(
+    key_id: i64,
+    state: &mut KeyRuntimeState,
+    now: DateTime<Local>,
+    allow_ban: bool,
+) {
+    ensure_runtime_day(state, now);
+    let entry = state.image_keys.entry(key_id).or_default();
+    clear_expired_ban(entry, now);
+    entry.fail_count += 1;
+    if !allow_ban {
+        entry.ban_until = None;
+    } else if entry.fail_count >= DAILY_BAN_FAILS {
+        entry.ban_until = Some(next_day_zero(now));
+    } else if entry.fail_count >= TEMP_BAN_FAILS {
+        entry.ban_until = Some(now + ChronoDuration::minutes(TEMP_BAN_MINUTES));
+    }
+}
+
+fn mark_image_key_success_in_state(key_id: i64, state: &mut KeyRuntimeState, now: DateTime<Local>) {
+    ensure_runtime_day(state, now);
+    state.image_keys.remove(&key_id);
+}
+
 async fn key_is_schedulable(state: &AppState, key: &ApiKeyConfig) -> bool {
     let mut runtime = state.runtime.write().await;
     key_availability_in_state(key, &mut runtime, Local::now()).schedulable
@@ -2800,8 +2926,27 @@ async fn mark_key_success(state: &AppState, key_id: i64) {
     mark_key_success_in_state(key_id, &mut runtime, Local::now());
 }
 
+async fn image_key_is_schedulable(state: &AppState, key: &ApiKeyConfig) -> bool {
+    let mut runtime = state.runtime.write().await;
+    image_key_availability_in_state(key, &mut runtime, Local::now()).schedulable
+}
+
+async fn mark_image_key_fail(state: &AppState, key_id: i64, allow_ban: bool) {
+    let mut runtime = state.runtime.write().await;
+    mark_image_key_fail_in_state(key_id, &mut runtime, Local::now(), allow_ban);
+}
+
+async fn mark_image_key_success(state: &AppState, key_id: i64) {
+    let mut runtime = state.runtime.write().await;
+    mark_image_key_success_in_state(key_id, &mut runtime, Local::now());
+}
+
 async fn clear_key_runtime(state: &AppState, key_id: i64) {
     state.runtime.write().await.keys.remove(&key_id);
+}
+
+async fn clear_image_key_runtime(state: &AppState, key_id: i64) {
+    state.runtime.write().await.image_keys.remove(&key_id);
 }
 
 async fn record_key_usage(
@@ -2911,24 +3056,43 @@ where
     }
 }
 
+async fn clear_image_key_runtimes<I>(state: &AppState, key_ids: I)
+where
+    I: IntoIterator<Item = i64>,
+{
+    let mut runtime = state.runtime.write().await;
+    for key_id in key_ids {
+        runtime.image_keys.remove(&key_id);
+    }
+}
+
 async fn clear_pool_runtime(state: &AppState, pool_id: i64) {
-    let key_ids: HashSet<i64> = state
+    let (key_ids, image_key_ids): (HashSet<i64>, HashSet<i64>) = state
         .pools
         .read()
         .await
         .iter()
         .find(|pool| pool.id == pool_id)
         .map(|pool| {
-            pool.base_urls
-                .iter()
-                .flat_map(|base_url| base_url.api_keys.iter().map(|key| key.id))
-                .collect()
+            (
+                pool.base_urls
+                    .iter()
+                    .flat_map(|base_url| base_url.api_keys.iter().map(|key| key.id))
+                    .collect(),
+                pool.base_urls
+                    .iter()
+                    .flat_map(|base_url| base_url.image_keys.iter().map(|key| key.id))
+                    .collect(),
+            )
         })
         .unwrap_or_default();
 
     let mut runtime = state.runtime.write().await;
     for key_id in key_ids {
         runtime.keys.remove(&key_id);
+    }
+    for key_id in image_key_ids {
+        runtime.image_keys.remove(&key_id);
     }
 }
 
@@ -3009,6 +3173,29 @@ async fn pools_response(state: &AppState) -> ProxiesResponse {
                             }
                         })
                         .collect::<Vec<_>>();
+                    let image_keys = base_url
+                        .image_keys
+                        .into_iter()
+                        .map(|key| {
+                            let availability =
+                                image_key_availability_in_state(&key, &mut runtime, now);
+                            ApiKeyView {
+                                id: key.id,
+                                api_key: key.api_key.clone(),
+                                masked_key: mask_key(&key.api_key),
+                                sort_order: key.sort_order,
+                                manually_disabled: key.manually_disabled,
+                                test_model: None,
+                                test_protocol: None,
+                                fail_count: availability.fail_count,
+                                banned: availability.banned,
+                                ban_until: availability.ban_until,
+                                last_used: false,
+                                last_used_at: None,
+                                last_used_by_access_key_name: None,
+                            }
+                        })
+                        .collect::<Vec<_>>();
                     let schedulable = available_key_count > 0;
                     if schedulable {
                         available_supplier_count += 1;
@@ -3030,6 +3217,7 @@ async fn pools_response(state: &AppState) -> ProxiesResponse {
                             .and_then(|item| access_key_names.get(&item.access_key_id))
                             .cloned(),
                         keys,
+                        image_keys,
                     }
                 })
                 .collect::<Vec<_>>();
@@ -3170,7 +3358,7 @@ async fn save_proxy_draft(
         Err(err) => return json_error(StatusCode::BAD_REQUEST, err),
     };
 
-    let (saved_pool_id, runtime_ids_to_clear) = {
+    let (saved_pool_id, runtime_ids_to_clear, image_runtime_ids_to_clear) = {
         let mut conn = match open_db(&state.db_path) {
             Ok(conn) => conn,
             Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
@@ -3192,7 +3380,7 @@ async fn save_proxy_draft(
             }
         };
 
-        let save_result: Result<(i64, HashSet<i64>), String> = (|| {
+        let save_result: Result<(i64, HashSet<i64>, HashSet<i64>), String> = (|| {
             let saved_pool_id = if let Some(pool_id) = pool_id {
                 let exists = tx
                     .query_row(
@@ -3240,6 +3428,8 @@ async fn save_proxy_draft(
 
             let mut existing_supplier_ids = HashSet::new();
             let mut existing_keys_by_supplier: HashMap<i64, HashMap<i64, String>> = HashMap::new();
+            let mut existing_image_keys_by_supplier: HashMap<i64, HashMap<i64, String>> =
+                HashMap::new();
 
             if pool_id.is_some() {
                 let mut supplier_stmt = tx
@@ -3279,10 +3469,37 @@ async fn save_proxy_draft(
                         .or_default()
                         .insert(key_id, api_key);
                 }
+
+                let mut image_key_stmt = tx
+                    .prepare(
+                        "SELECT k.id, k.base_url_id, k.api_key
+                         FROM pool_image_keys k
+                         JOIN pool_base_urls b ON b.id = k.base_url_id
+                         WHERE b.pool_id = ?1",
+                    )
+                    .map_err(|err| format!("Failed to prepare image key query: {err}"))?;
+                let image_key_rows = image_key_stmt
+                    .query_map(params![saved_pool_id], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })
+                    .map_err(|err| format!("Failed to query image keys: {err}"))?;
+                for row in image_key_rows {
+                    let (key_id, supplier_id, api_key) =
+                        row.map_err(|err| format!("Failed to decode image key row: {err}"))?;
+                    existing_image_keys_by_supplier
+                        .entry(supplier_id)
+                        .or_default()
+                        .insert(key_id, api_key);
+                }
             }
 
             let mut seen_supplier_ids = HashSet::new();
             let mut runtime_ids_to_clear = HashSet::new();
+            let mut image_runtime_ids_to_clear = HashSet::new();
 
             for (supplier_sort_order, supplier) in payload.suppliers.iter().enumerate() {
                 let supplier_id = if let Some(supplier_id) = supplier.id {
@@ -3371,6 +3588,52 @@ async fn save_proxy_draft(
                         runtime_ids_to_clear.insert(*key_id);
                     }
                 }
+
+                let supplier_existing_image_keys = existing_image_keys_by_supplier
+                    .get(&supplier_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let mut seen_image_key_ids = HashSet::new();
+
+                for (key_sort_order, key) in supplier.image_keys.iter().enumerate() {
+                    if let Some(key_id) = key.id {
+                        let Some(existing_api_key) = supplier_existing_image_keys.get(&key_id)
+                        else {
+                            return Err("image_api_key not found".to_string());
+                        };
+                        if !seen_image_key_ids.insert(key_id) {
+                            return Err("duplicate image_api_key id in payload".to_string());
+                        }
+
+                        if existing_api_key != &key.api_key {
+                            image_runtime_ids_to_clear.insert(key_id);
+                        }
+
+                        tx.execute(
+                            "UPDATE pool_image_keys
+                             SET api_key = ?1, sort_order = ?2, updated_at = strftime('%s', 'now')
+                             WHERE id = ?3",
+                            params![&key.api_key, key_sort_order as i64, key_id],
+                        )
+                        .map_err(|err| format!("Failed to update image api_key: {err}"))?;
+                    } else {
+                        tx.execute(
+                            "INSERT INTO pool_image_keys
+                             (base_url_id, api_key, sort_order, manually_disabled, created_at, updated_at)
+                             VALUES (?1, ?2, ?3, 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                            params![supplier_id, &key.api_key, key_sort_order as i64],
+                        )
+                        .map_err(|err| format!("Failed to create image api_key: {err}"))?;
+                    }
+                }
+
+                for key_id in supplier_existing_image_keys.keys() {
+                    if !seen_image_key_ids.contains(key_id) {
+                        tx.execute("DELETE FROM pool_image_keys WHERE id = ?1", params![key_id])
+                            .map_err(|err| format!("Failed to delete image api_key: {err}"))?;
+                        image_runtime_ids_to_clear.insert(*key_id);
+                    }
+                }
             }
 
             for supplier_id in existing_supplier_ids {
@@ -3378,6 +3641,13 @@ async fn save_proxy_draft(
                     if let Some(existing_keys) = existing_keys_by_supplier.get(&supplier_id) {
                         for key_id in existing_keys.keys() {
                             runtime_ids_to_clear.insert(*key_id);
+                        }
+                    }
+                    if let Some(existing_image_keys) =
+                        existing_image_keys_by_supplier.get(&supplier_id)
+                    {
+                        for key_id in existing_image_keys.keys() {
+                            image_runtime_ids_to_clear.insert(*key_id);
                         }
                     }
                     tx.execute(
@@ -3388,10 +3658,14 @@ async fn save_proxy_draft(
                 }
             }
 
-            Ok((saved_pool_id, runtime_ids_to_clear))
+            Ok((
+                saved_pool_id,
+                runtime_ids_to_clear,
+                image_runtime_ids_to_clear,
+            ))
         })();
 
-        let (saved_pool_id, runtime_ids_to_clear) = match save_result {
+        let (saved_pool_id, runtime_ids_to_clear, image_runtime_ids_to_clear) = match save_result {
             Ok(result) => result,
             Err(err) if err == "proxy not found" => {
                 return json_error(StatusCode::NOT_FOUND, err);
@@ -3399,8 +3673,10 @@ async fn save_proxy_draft(
             Err(err)
                 if err == "supplier not found"
                     || err == "api_key not found"
+                    || err == "image_api_key not found"
                     || err == "duplicate supplier id in payload"
-                    || err == "duplicate api_key id in payload" =>
+                    || err == "duplicate api_key id in payload"
+                    || err == "duplicate image_api_key id in payload" =>
             {
                 return json_error(StatusCode::BAD_REQUEST, err);
             }
@@ -3417,10 +3693,15 @@ async fn save_proxy_draft(
             );
         }
 
-        (saved_pool_id, runtime_ids_to_clear)
+        (
+            saved_pool_id,
+            runtime_ids_to_clear,
+            image_runtime_ids_to_clear,
+        )
     };
 
     clear_key_runtimes(state, runtime_ids_to_clear).await;
+    clear_image_key_runtimes(state, image_runtime_ids_to_clear).await;
     if let Err(err) = reload_state(state).await {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
     }
@@ -4252,6 +4533,62 @@ async fn unban_key(State(state): State<AppState>, Path(id): Path<i64>) -> Respon
     json_ok()
 }
 
+async fn set_image_key_disabled(state: &AppState, id: i64, disabled: bool) -> Response<Body> {
+    let conn = match open_db(&state.db_path) {
+        Ok(conn) => conn,
+        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+
+    match conn.execute(
+        "UPDATE pool_image_keys
+         SET manually_disabled = ?1, updated_at = strftime('%s', 'now')
+         WHERE id = ?2",
+        params![if disabled { 1 } else { 0 }, id],
+    ) {
+        Ok(0) => return json_error(StatusCode::NOT_FOUND, "image api_key not found"),
+        Ok(_) => {}
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to update image api_key: {err}"),
+            )
+        }
+    }
+
+    if !disabled {
+        clear_image_key_runtime(state, id).await;
+    }
+    if let Err(err) = reload_pools(state).await {
+        return json_error(StatusCode::INTERNAL_SERVER_ERROR, err);
+    }
+    json_ok()
+}
+
+async fn disable_image_key(State(state): State<AppState>, Path(id): Path<i64>) -> Response<Body> {
+    set_image_key_disabled(&state, id, true).await
+}
+
+async fn enable_image_key(State(state): State<AppState>, Path(id): Path<i64>) -> Response<Body> {
+    set_image_key_disabled(&state, id, false).await
+}
+
+async fn unban_image_key(State(state): State<AppState>, Path(id): Path<i64>) -> Response<Body> {
+    let exists = state
+        .pools
+        .read()
+        .await
+        .iter()
+        .flat_map(|pool| pool.base_urls.iter())
+        .flat_map(|base_url| base_url.image_keys.iter())
+        .any(|key| key.id == id);
+    if !exists {
+        return json_error(StatusCode::NOT_FOUND, "image api_key not found");
+    }
+
+    clear_image_key_runtime(&state, id).await;
+    json_ok()
+}
+
 fn parse_model_ids(body: &[u8]) -> Result<Vec<String>, String> {
     let value: Value = serde_json::from_slice(body)
         .map_err(|err| format!("invalid models response JSON: {err}"))?;
@@ -4581,6 +4918,7 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
     } else {
         None
     };
+    let is_image_request = method == Method::POST && path == IMAGES_GENERATIONS_PATH;
 
     let query = req.uri().query().map(ToOwned::to_owned);
     let (parts, body) = req.into_parts();
@@ -4596,7 +4934,11 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
     };
     let is_streaming = is_stream_request(&buffered_body);
     let mut last_error: Option<ProxyAttemptError> = None;
-    let allow_auto_ban = !pool_has_single_supplier_and_key(&pool);
+    let allow_auto_ban = if is_image_request {
+        !image_request_has_single_candidate(&pool)
+    } else {
+        !pool_has_single_supplier_and_key(&pool)
+    };
     let request_body_preview = if path == RESPONSES_PATH {
         Some(
             String::from_utf8_lossy(&buffered_body)
@@ -4622,8 +4964,9 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
         };
         let mut bridge_context = transformed_request.bridge_context.clone();
         let upstream_body = transformed_request.body;
-        let effective_override_model =
-            effective_override_model(&access_key, &base_url).map(ToOwned::to_owned);
+        let effective_override_model = (!is_image_request)
+            .then(|| effective_override_model(&access_key, &base_url).map(ToOwned::to_owned))
+            .flatten();
         let upstream_body = if let Some(model) = effective_override_model.as_deref() {
             match override_model_in_body(&upstream_body, model) {
                 Ok(body) => body,
@@ -4632,9 +4975,19 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
         } else {
             upstream_body
         };
-        for key in base_url.api_keys {
+        let (keys, using_image_keys) = if is_image_request && !base_url.image_keys.is_empty() {
+            (base_url.image_keys, true)
+        } else {
+            (base_url.api_keys, false)
+        };
+        for key in keys {
             loop {
-                if !key_is_schedulable(&state, &key).await {
+                let schedulable = if using_image_keys {
+                    image_key_is_schedulable(&state, &key).await
+                } else {
+                    key_is_schedulable(&state, &key).await
+                };
+                if !schedulable {
                     break;
                 }
 
@@ -4658,8 +5011,15 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                 };
 
                 info!(
-                    "{} {} -> access_key={} proxy={} supplier_id={} key_id={} {}",
-                    parts.method, path, access_key.id, pool.id, base_url.id, key.id, upstream_path
+                    "{} {} -> access_key={} proxy={} supplier_id={} key_id={} key_scope={} {}",
+                    parts.method,
+                    path,
+                    access_key.id,
+                    pool.id,
+                    base_url.id,
+                    key.id,
+                    if using_image_keys { "image" } else { "chat" },
+                    upstream_path
                 );
                 if path == RESPONSES_PATH {
                     info!(
@@ -4695,7 +5055,11 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                                 upstream_url_text
                             );
                         }
-                        mark_key_fail(&state, key.id, allow_auto_ban).await;
+                        if using_image_keys {
+                            mark_image_key_fail(&state, key.id, allow_auto_ban).await;
+                        } else {
+                            mark_key_fail(&state, key.id, allow_auto_ban).await;
+                        }
 
                         if let Some(model) = effective_override_model
                             .as_deref()
@@ -4715,7 +5079,12 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                         if !allow_auto_ban {
                             break;
                         }
-                        if key_is_schedulable(&state, &key).await {
+                        let schedulable = if using_image_keys {
+                            image_key_is_schedulable(&state, &key).await
+                        } else {
+                            key_is_schedulable(&state, &key).await
+                        };
+                        if schedulable {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             continue;
                         }
@@ -4731,8 +5100,13 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                                 upstream_url_text
                             );
                         }
-                        mark_key_success(&state, key.id).await;
-                        record_key_usage(&state, access_key.id, pool.id, base_url.id, key.id).await;
+                        if using_image_keys {
+                            mark_image_key_success(&state, key.id).await;
+                        } else {
+                            mark_key_success(&state, key.id).await;
+                            record_key_usage(&state, access_key.id, pool.id, base_url.id, key.id)
+                                .await;
+                        }
                         let mut downstream = Response::builder().status(response.status());
                         if let Some(headers_mut) = downstream.headers_mut() {
                             match response_headers(
@@ -4806,7 +5180,11 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                                 upstream_url_text
                             );
                         }
-                        mark_key_fail(&state, key.id, allow_auto_ban).await;
+                        if using_image_keys {
+                            mark_image_key_fail(&state, key.id, allow_auto_ban).await;
+                        } else {
+                            mark_key_fail(&state, key.id, allow_auto_ban).await;
+                        }
 
                         if let Some(model) = effective_override_model
                             .as_deref()
@@ -4826,7 +5204,12 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                         if !allow_auto_ban {
                             break;
                         }
-                        if key_is_schedulable(&state, &key).await {
+                        let schedulable = if using_image_keys {
+                            image_key_is_schedulable(&state, &key).await
+                        } else {
+                            key_is_schedulable(&state, &key).await
+                        };
+                        if schedulable {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             continue;
                         }
@@ -4842,7 +5225,11 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                                 err
                             );
                         }
-                        mark_key_fail(&state, key.id, allow_auto_ban).await;
+                        if using_image_keys {
+                            mark_image_key_fail(&state, key.id, allow_auto_ban).await;
+                        } else {
+                            mark_key_fail(&state, key.id, allow_auto_ban).await;
+                        }
 
                         if let Some(model) = effective_override_model
                             .as_deref()
@@ -4862,7 +5249,12 @@ async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<B
                         if !allow_auto_ban {
                             break;
                         }
-                        if key_is_schedulable(&state, &key).await {
+                        let schedulable = if using_image_keys {
+                            image_key_is_schedulable(&state, &key).await
+                        } else {
+                            key_is_schedulable(&state, &key).await
+                        };
+                        if schedulable {
                             tokio::time::sleep(Duration::from_secs(1)).await;
                             continue;
                         }
@@ -4958,6 +5350,12 @@ async fn main() {
         .route("/admin/api/keys/{id}/models", get(key_models))
         .route("/admin/api/keys/{id}/test", post(test_key))
         .route("/admin/api/keys/{id}/unban", post(unban_key))
+        .route(
+            "/admin/api/image-keys/{id}/disable",
+            post(disable_image_key),
+        )
+        .route("/admin/api/image-keys/{id}/enable", post(enable_image_key))
+        .route("/admin/api/image-keys/{id}/unban", post(unban_image_key))
         .layer(middleware::from_fn_with_state(state.clone(), admin_auth));
 
     let app = Router::new()
@@ -5282,6 +5680,204 @@ mod tests {
     }
 
     #[test]
+    fn image_key_runtime_is_isolated_from_chat_key_runtime() {
+        let key = ApiKeyConfig {
+            id: 1,
+            base_url_id: 1,
+            api_key: "sk-test".to_string(),
+            sort_order: 0,
+            manually_disabled: false,
+            test_model: String::new(),
+            test_protocol: None,
+        };
+        let now = fixed_now();
+        let mut state = KeyRuntimeState::default();
+        state.last_reset_date = now.date_naive();
+
+        for _ in 0..TEMP_BAN_FAILS {
+            mark_key_fail_in_state(key.id, &mut state, now, true);
+        }
+
+        assert!(key_availability_in_state(&key, &mut state, now).banned);
+        assert!(image_key_availability_in_state(&key, &mut state, now).schedulable);
+
+        mark_image_key_fail_in_state(key.id, &mut state, now, false);
+        assert_eq!(
+            image_key_availability_in_state(&key, &mut state, now).fail_count,
+            1
+        );
+        assert_eq!(
+            key_availability_in_state(&key, &mut state, now).fail_count,
+            3
+        );
+    }
+
+    #[test]
+    fn image_request_uses_only_image_candidates_when_present() {
+        let make_key = |id| ApiKeyConfig {
+            id,
+            base_url_id: 1,
+            api_key: format!("sk-{id}"),
+            sort_order: id,
+            manually_disabled: false,
+            test_model: String::new(),
+            test_protocol: None,
+        };
+        let mut pool = PoolConfig {
+            id: 1,
+            name: "测试代理".to_string(),
+            note: String::new(),
+            is_active: true,
+            base_urls: vec![BaseUrlConfig {
+                id: 1,
+                pool_id: 1,
+                name: "供应商".to_string(),
+                base_url: "https://api.example.com/v1".to_string(),
+                protocol_mode: ProtocolMode::Both,
+                override_model: String::new(),
+                sort_order: 0,
+                api_keys: vec![make_key(1), make_key(2)],
+                image_keys: vec![make_key(3)],
+            }],
+        };
+
+        assert!(image_request_has_single_candidate(&pool));
+
+        pool.base_urls[0].image_keys.clear();
+        assert!(!image_request_has_single_candidate(&pool));
+    }
+
+    #[test]
+    fn image_keys_are_persisted_and_loaded_independently() {
+        let path = temp_db_path("image-keys");
+        init_database(&path).unwrap();
+
+        {
+            let conn = open_db(&path).unwrap();
+            conn.execute(
+                "INSERT INTO pools (name, note, is_active, created_at, updated_at)
+                 VALUES ('测试代理', '', 1, strftime('%s', 'now'), strftime('%s', 'now'))",
+                [],
+            )
+            .unwrap();
+            let pool_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO pool_base_urls (pool_id, name, base_url, protocol_mode, sort_order, created_at, updated_at)
+                 VALUES (?1, '供应商 A', 'https://api.example.com/v1', 'both', 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![pool_id],
+            )
+            .unwrap();
+            let supplier_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO pool_api_keys (base_url_id, api_key, sort_order, manually_disabled, created_at, updated_at)
+                 VALUES (?1, 'sk-chat', 0, 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![supplier_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pool_image_keys (base_url_id, api_key, sort_order, manually_disabled, created_at, updated_at)
+                 VALUES (?1, 'sk-image', 0, 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![supplier_id],
+            )
+            .unwrap();
+        }
+
+        let pools = load_pools(&path).unwrap();
+        let supplier = &pools[0].base_urls[0];
+        assert_eq!(supplier.api_keys[0].api_key, "sk-chat");
+        assert_eq!(supplier.image_keys[0].api_key, "sk-image");
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn image_generation_uses_image_key_without_overriding_image_model() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let upstream = Router::new().route(
+            IMAGES_GENERATIONS_PATH,
+            post(move |headers: HeaderMap, body: Bytes| {
+                let request_tx = request_tx.clone();
+                async move {
+                    let authorization = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    request_tx.send((authorization, body)).unwrap();
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"created":0,"data":[]}"#,
+                    )
+                }
+            }),
+        );
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let path = temp_db_path("image-generation-route");
+        init_database(&path).unwrap();
+        let access_key = "me-1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd";
+        {
+            let conn = open_db(&path).unwrap();
+            conn.execute(
+                "INSERT INTO pools (name, note, is_active, created_at, updated_at)
+                 VALUES ('测试代理', '', 1, strftime('%s', 'now'), strftime('%s', 'now'))",
+                [],
+            )
+            .unwrap();
+            let pool_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO pool_base_urls (pool_id, name, base_url, protocol_mode, override_model, sort_order, created_at, updated_at)
+                 VALUES (?1, '供应商 A', ?2, 'both', 'gpt-chat-only', 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![pool_id, format!("http://{address}")],
+            )
+            .unwrap();
+            let supplier_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO pool_api_keys (base_url_id, api_key, sort_order, manually_disabled, created_at, updated_at)
+                 VALUES (?1, 'sk-chat', 0, 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![supplier_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO pool_image_keys (base_url_id, api_key, sort_order, manually_disabled, created_at, updated_at)
+                 VALUES (?1, 'sk-image', 0, 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![supplier_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO access_keys (name, access_key, proxy_id, created_at, updated_at)
+                 VALUES ('客户端 A', ?1, ?2, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![access_key, pool_id],
+            )
+            .unwrap();
+        }
+
+        let state = test_app_state(&path);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(IMAGES_GENERATIONS_PATH)
+            .header(header::AUTHORIZATION, format!("Bearer {access_key}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"model":"gpt-image-1","prompt":"a cat"}"#))
+            .unwrap();
+        let response = proxy_openai(State(state), request).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let (authorization, body) = request_rx.recv().await.unwrap();
+        assert_eq!(authorization, "Bearer sk-image");
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["model"], "gpt-image-1");
+
+        upstream_task.abort();
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn generated_access_key_uses_me_prefix() {
         let access_key = generate_access_key_value();
         assert!(access_key.starts_with("me-"));
@@ -5312,6 +5908,7 @@ mod tests {
             override_model: model.to_string(),
             sort_order: 0,
             api_keys: Vec::new(),
+            image_keys: Vec::new(),
         }
     }
 
