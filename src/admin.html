@@ -1488,6 +1488,22 @@
       return formatUsageTime(timestamp);
     }
 
+    function formatSupplierUsage(timestamp) {
+      if (!timestamp) return '';
+      const usageDate = new Date(Number(timestamp) * 1000);
+      if (Number.isNaN(usageDate.getTime())) return '';
+
+      const now = new Date();
+      const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+      const usageDay = new Date(usageDate.getFullYear(), usageDate.getMonth(), usageDate.getDate());
+      const dayDiff = Math.round((today - usageDay) / 86400000);
+
+      if (dayDiff === 1) return '昨天';
+      if (dayDiff === 2) return '前天';
+      if (dayDiff > 2) return '';
+      return formatRelativeUsage(timestamp);
+    }
+
     function keyStatusText(key) {
       if (key.manuallyDisabled) return '永久禁用';
       if (key.banned) {
@@ -1657,8 +1673,10 @@
 
     function supplierUsageText(base) {
       if (!base.lastUsedAt) return '';
+      const usageTime = formatSupplierUsage(base.lastUsedAt);
+      if (!usageTime) return '';
       const accessKeyName = base.lastUsedByAccessKeyName ? ` · ${base.lastUsedByAccessKeyName}` : '';
-      return `最近命中${accessKeyName} · ${formatRelativeUsage(base.lastUsedAt)}`;
+      return `最近命中${accessKeyName} · ${usageTime}`;
     }
 
     function keyLastUsedText(key) {
@@ -2294,9 +2312,6 @@
         return;
       }
 
-      const totalChatKeys = pool.baseUrls.reduce((sum, item) => sum + item.keys.length, 0);
-      const totalImageKeys = pool.baseUrls.reduce((sum, item) => sum + item.imageKeys.length, 0);
-
       editorTitle.textContent = `${pool.name} · 编辑`;
       editorSub.textContent = pool.id
         ? '编辑代理基本信息，并在下方维护供应商与 API Key。删除后会同步清理已绑定的接入 Key。'
@@ -2319,11 +2334,8 @@
               <div class="summary-side">
                 <div class="summary-items">
                   <span class="status-chip ${state.saveState}">${saveStatusText()}</span>
-                  <span class="summary-chip">${pool.inUse ? '使用中' : '未接入'}</span>
                   <span class="summary-chip">接入 Key ${pool.accessKeyCount} 个</span>
                   <span class="summary-chip">供应商 ${pool.baseUrls.length} 个</span>
-                  <span class="summary-chip">聊天 Key ${totalChatKeys} 个</span>
-                  <span class="summary-chip">生图 Key ${totalImageKeys} 个</span>
                 </div>
                 <div class="summary-actions">
                   ${pool.id ? '<button class="button danger" data-action="delete-pool" data-local-id="' + pool.localId + '">删除代理</button>' : ''}
@@ -2367,10 +2379,6 @@
         dragging ? 'dragging' : '',
         dragOverPosition ? `drag-over-${dragOverPosition}` : ''
       ].filter(Boolean).join(' ');
-      const keyCountText = `聊天 Key ${base.keys.length} 个`;
-      const imageKeyCountText = base.imageKeys.length
-        ? `生图 Key ${base.imageKeys.length} 个`
-        : '生图复用聊天 Key';
       const usageText = supplierUsageText(base);
 
       return `
@@ -2386,8 +2394,6 @@
                 <div class="base-title-line">
                   <h4>${escapeHtml(baseTitle(base))}</h4>
                   <span class="tag idle">${escapeHtml(protocolLabel(base.protocol))}</span>
-                  <span class="summary-chip">${keyCountText}</span>
-                  <span class="summary-chip">${imageKeyCountText}</span>
                   ${usageText ? '<span class="summary-chip">最近命中</span>' : ''}
                 </div>
                 <div class="base-url-summary">${escapeHtml(baseUrlSummary(base))}</div>
@@ -2447,7 +2453,6 @@
                 <div class="key-group-head">
                   <div class="key-group-title">
                     <strong>聊天 Key</strong>
-                    <span>用于 Chat 和 Responses 请求</span>
                   </div>
                   <button class="button light" data-action="add-key" data-local-id="${pool.localId}" data-base-local-id="${base.localId}">+ 新增</button>
                 </div>
@@ -2459,7 +2464,6 @@
                 <div class="key-group-head">
                   <div class="key-group-title">
                     <strong>生图 Key</strong>
-                    <span>${base.imageKeys.length ? '用于 /v1/images/generations 请求' : '未配置时自动复用聊天 Key'}</span>
                   </div>
                   <button class="button light" data-action="add-image-key" data-local-id="${pool.localId}" data-base-local-id="${base.localId}">+ 新增</button>
                 </div>
