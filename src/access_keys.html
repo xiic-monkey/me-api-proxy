@@ -169,16 +169,16 @@
 
     .key-card {
       display: grid;
-      gap: 12px;
+      gap: 14px;
       padding: 16px;
       border: 1px solid var(--line);
-      border-radius: 16px;
+      border-radius: 12px;
       background: #fcfcfd;
     }
 
     .key-grid {
       display: grid;
-      grid-template-columns: 180px minmax(0, 1fr) 190px minmax(180px, 260px);
+      grid-template-columns: minmax(180px, 0.8fr) minmax(260px, 1.5fr) minmax(200px, 1fr);
       gap: 12px;
       align-items: start;
     }
@@ -206,6 +206,31 @@
       font: inherit;
       outline: none;
       transition: border-color 0.16s ease, box-shadow 0.16s ease;
+    }
+
+    .proxy-bindings {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      padding-top: 14px;
+      border-top: 1px solid var(--line);
+    }
+
+    .binding-option {
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .binding-option span {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .binding-option select {
+      min-width: 0;
+      font-size: inherit;
     }
 
     input:focus,
@@ -261,6 +286,10 @@
       }
 
       .key-grid {
+        grid-template-columns: 1fr;
+      }
+
+      .proxy-bindings {
         grid-template-columns: 1fr;
       }
     }
@@ -385,6 +414,8 @@
         accessKey: item.access_key,
         proxyId: item.proxy_id,
         proxyName: item.proxy_name,
+        imageProxyId: item.image_proxy_id ?? '',
+        imageProxyName: item.image_proxy_name || '',
         overrideModel: item.override_model || '',
         createdAt: item.created_at,
         updatedAt: item.updated_at,
@@ -398,6 +429,14 @@
 
     function currentProxyName(proxyId) {
       return state.proxies.find(proxy => proxy.id === Number(proxyId))?.name || '';
+    }
+
+    function proxyOptions(selectedProxyId, emptyLabel = '') {
+      const selectedValue = selectedProxyId == null ? '' : String(selectedProxyId);
+      const emptyOption = emptyLabel ? `<option value="">${escapeHtml(emptyLabel)}</option>` : '';
+      return `${emptyOption}${state.proxies.map(proxy => `
+        <option value="${proxy.id}" ${selectedValue === String(proxy.id) ? 'selected' : ''}>${escapeHtml(proxy.name)}</option>
+      `).join('')}`;
     }
 
     async function loadAccessKeys() {
@@ -428,6 +467,8 @@
         accessKey: '',
         proxyId: defaultProxy,
         proxyName: currentProxyName(defaultProxy),
+        imageProxyId: '',
+        imageProxyName: '',
         overrideModel: '',
         createdAt: null,
         updatedAt: null,
@@ -469,6 +510,7 @@
         const payload = {
           name: item.name.trim(),
           proxy_id: Number(item.proxyId),
+          image_proxy_id: item.imageProxyId ? Number(item.imageProxyId) : null,
           override_model: (item.overrideModel || '').trim()
         };
 
@@ -522,7 +564,11 @@
     }
 
     function renderSummary() {
-      const boundProxyIds = new Set(state.items.filter(item => item.proxyId).map(item => Number(item.proxyId)));
+      const boundProxyIds = new Set();
+      state.items.forEach(item => {
+        if (item.proxyId) boundProxyIds.add(Number(item.proxyId));
+        if (item.imageProxyId) boundProxyIds.add(Number(item.imageProxyId));
+      });
       summary.innerHTML = `
         <div class="chip">接入 Key ${state.items.length} 个</div>
         <div class="chip">已接入代理 ${boundProxyIds.size} 个</div>
@@ -556,15 +602,6 @@
               <input class="key-value" readonly value="${escapeAttr(item.accessKey || '保存后自动生成 me-Key')}" />
             </div>
             <div class="field">
-              <label>绑定代理</label>
-              <select data-input="proxy" data-local-id="${item.localId}">
-                <option value="">请选择代理</option>
-                ${state.proxies.map(proxy => `
-                  <option value="${proxy.id}" ${Number(item.proxyId) === proxy.id ? 'selected' : ''}>${escapeHtml(proxy.name)}</option>
-                `).join('')}
-              </select>
-            </div>
-            <div class="field">
               <label>强制模型</label>
               <input
                 value="${escapeAttr(item.overrideModel || '')}"
@@ -574,9 +611,22 @@
               />
             </div>
           </div>
+          <div class="proxy-bindings">
+            <label class="binding-option">
+              <span>聊天代理</span>
+              <select aria-label="聊天绑定代理" data-input="proxy" data-local-id="${item.localId}">
+                ${proxyOptions(item.proxyId, '请选择代理')}
+              </select>
+            </label>
+            <label class="binding-option">
+              <span>生图代理</span>
+              <select aria-label="生图绑定代理" data-input="image-proxy" data-local-id="${item.localId}">
+                ${proxyOptions(item.imageProxyId, '跟随聊天代理')}
+              </select>
+            </label>
+          </div>
           <div class="meta">
             <div>
-              <div>当前代理：${escapeHtml(item.proxyName || currentProxyName(item.proxyId) || '-')}</div>
               <div class="usage-text">${escapeHtml(lastUsedText(item))}</div>
               <div>创建于：${escapeHtml(formatTime(item.createdAt))}　更新于：${escapeHtml(formatTime(item.updatedAt))}</div>
               ${item.error ? `<div style="color:var(--red); margin-top:4px;">${escapeHtml(item.error)}</div>` : ''}
@@ -630,6 +680,14 @@
       if (inputType === 'proxy') {
         item.proxyId = target.value;
         item.proxyName = currentProxyName(target.value);
+        item.error = '';
+        render();
+        return;
+      }
+
+      if (inputType === 'image-proxy') {
+        item.imageProxyId = target.value;
+        item.imageProxyName = currentProxyName(target.value);
         item.error = '';
         render();
         return;

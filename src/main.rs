@@ -236,6 +236,7 @@ struct AccessKeyConfig {
     name: String,
     access_key: String,
     proxy_id: i64,
+    image_proxy_id: Option<i64>,
     override_model: String,
     created_at: i64,
     updated_at: i64,
@@ -415,6 +416,8 @@ struct AccessKeyPayload {
     name: String,
     proxy_id: i64,
     #[serde(default)]
+    image_proxy_id: Option<i64>,
+    #[serde(default)]
     override_model: String,
 }
 
@@ -486,6 +489,8 @@ struct AccessKeyView {
     masked_key: String,
     proxy_id: i64,
     proxy_name: String,
+    image_proxy_id: Option<i64>,
+    image_proxy_name: Option<String>,
     override_model: String,
     created_at: i64,
     updated_at: i64,
@@ -654,6 +659,7 @@ fn init_database(path: &PathBuf) -> Result<(), String> {
             name TEXT NOT NULL,
             access_key TEXT NOT NULL UNIQUE,
             proxy_id INTEGER NOT NULL,
+            image_proxy_id INTEGER,
             override_model TEXT NOT NULL DEFAULT '',
             created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
             updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now')),
@@ -731,6 +737,13 @@ fn init_database(path: &PathBuf) -> Result<(), String> {
             [],
         )
         .map_err(|err| format!("Failed to add access key override_model column: {err}"))?;
+    }
+    if !access_key_columns.contains("image_proxy_id") {
+        conn.execute(
+            "ALTER TABLE access_keys ADD COLUMN image_proxy_id INTEGER",
+            [],
+        )
+        .map_err(|err| format!("Failed to add access key image_proxy_id column: {err}"))?;
     }
 
     migrate_legacy_openai_config(&conn)?;
@@ -1316,7 +1329,7 @@ fn load_access_keys(path: &PathBuf) -> Result<Vec<AccessKeyConfig>, String> {
     let conn = open_db(path)?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, name, access_key, proxy_id, override_model, created_at, updated_at
+            "SELECT id, name, access_key, proxy_id, image_proxy_id, override_model, created_at, updated_at
              FROM access_keys
              ORDER BY created_at DESC, id DESC",
         )
@@ -1328,9 +1341,10 @@ fn load_access_keys(path: &PathBuf) -> Result<Vec<AccessKeyConfig>, String> {
                 name: row.get(1)?,
                 access_key: row.get(2)?,
                 proxy_id: row.get(3)?,
-                override_model: row.get(4)?,
-                created_at: row.get(5)?,
-                updated_at: row.get(6)?,
+                image_proxy_id: row.get(4)?,
+                override_model: row.get(5)?,
+                created_at: row.get(6)?,
+                updated_at: row.get(7)?,
             })
         })
         .map_err(|err| format!("Failed to query access keys: {err}"))?;
@@ -2540,6 +2554,16 @@ fn chat_chunk(id: &str, model: &str, delta: Value, finish_reason: Value) -> Stri
     )
 }
 
+fn is_ignored_sse_payload(data: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<Value>(data) else {
+        return false;
+    };
+    value
+        .get("object")
+        .and_then(Value::as_str)
+        .is_some_and(|object| object == "billing.summary")
+}
+
 fn chat_sse_to_responses_event(data: &str, completed_sent: &mut bool) -> Option<String> {
     if data == "[DONE]" {
         if *completed_sent {
@@ -2697,6 +2721,9 @@ fn transform_sse_event(
     completed_sent: &mut bool,
 ) -> Option<String> {
     let data = sse_data_payload(event)?;
+    if is_ignored_sse_payload(&data) {
+        return None;
+    }
     match conversion {
         ConversionMode::Direct => Some(format!("{event}\n\n")),
         ConversionMode::ChatToResponses => responses_sse_to_chat_event(&data, completed_sent),
@@ -3114,12 +3141,19 @@ async fn pools_response(state: &AppState) -> ProxiesResponse {
     let mut runtime = state.runtime.write().await;
     ensure_runtime_day(&mut runtime, now);
 
-    let binding_counts = access_keys
-        .iter()
-        .fold(HashMap::new(), |mut map, access_key| {
-            *map.entry(access_key.proxy_id).or_insert(0usize) += 1;
-            map
-        });
+    let mut binding_counts: HashMap<i64, HashSet<i64>> = HashMap::new();
+    for access_key in &access_keys {
+        binding_counts
+            .entry(access_key.proxy_id)
+            .or_default()
+            .insert(access_key.id);
+        if let Some(image_proxy_id) = access_key.image_proxy_id {
+            binding_counts
+                .entry(image_proxy_id)
+                .or_default()
+                .insert(access_key.id);
+        }
+    }
     let access_key_names: HashMap<i64, String> = access_keys
         .iter()
         .map(|item| (item.id, item.name.clone()))
@@ -3127,7 +3161,7 @@ async fn pools_response(state: &AppState) -> ProxiesResponse {
     let proxies = pools
         .into_iter()
         .map(|pool| {
-            let access_key_count = binding_counts.get(&pool.id).copied().unwrap_or(0);
+            let access_key_count = binding_counts.get(&pool.id).map(HashSet::len).unwrap_or(0);
             let mut available_supplier_count = 0usize;
             let suppliers = pool
                 .base_urls
@@ -3303,6 +3337,10 @@ async fn access_keys_response(state: &AppState) -> AccessKeysResponse {
                 .get(&access_key.proxy_id)
                 .cloned()
                 .unwrap_or_else(|| "已删除代理".to_string()),
+            image_proxy_id: access_key.image_proxy_id,
+            image_proxy_name: access_key
+                .image_proxy_id
+                .and_then(|proxy_id| proxy_names.get(&proxy_id).cloned()),
             override_model: access_key.override_model,
             created_at: access_key.created_at,
             updated_at: access_key.updated_at,
@@ -3865,6 +3903,13 @@ async fn create_access_key(
         Ok(false) => return json_error(StatusCode::BAD_REQUEST, "proxy not found"),
         Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
+    if let Some(image_proxy_id) = payload.image_proxy_id {
+        match proxy_exists(&conn, image_proxy_id) {
+            Ok(true) => {}
+            Ok(false) => return json_error(StatusCode::BAD_REQUEST, "image proxy not found"),
+            Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+        }
+    }
 
     let access_key = match generate_unique_access_key(&conn) {
         Ok(access_key) => access_key,
@@ -3872,9 +3917,15 @@ async fn create_access_key(
     };
 
     let id = match conn.execute(
-        "INSERT INTO access_keys (name, access_key, proxy_id, override_model, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, strftime('%s', 'now'), strftime('%s', 'now'))",
-        params![name, access_key, payload.proxy_id, override_model],
+        "INSERT INTO access_keys (name, access_key, proxy_id, image_proxy_id, override_model, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, strftime('%s', 'now'), strftime('%s', 'now'))",
+        params![
+            name,
+            access_key,
+            payload.proxy_id,
+            payload.image_proxy_id,
+            override_model
+        ],
     ) {
         Ok(_) => conn.last_insert_rowid(),
         Err(err) => {
@@ -3912,12 +3963,19 @@ async fn update_access_key(
         Ok(false) => return json_error(StatusCode::BAD_REQUEST, "proxy not found"),
         Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
     }
+    if let Some(image_proxy_id) = payload.image_proxy_id {
+        match proxy_exists(&conn, image_proxy_id) {
+            Ok(true) => {}
+            Ok(false) => return json_error(StatusCode::BAD_REQUEST, "image proxy not found"),
+            Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+        }
+    }
 
-    let current_proxy_id: Option<i64> = match conn
+    let current_proxy_ids: Option<(i64, Option<i64>)> = match conn
         .query_row(
-            "SELECT proxy_id FROM access_keys WHERE id = ?1",
+            "SELECT proxy_id, image_proxy_id FROM access_keys WHERE id = ?1",
             params![id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()
     {
@@ -3929,15 +3987,21 @@ async fn update_access_key(
             )
         }
     };
-    let Some(current_proxy_id) = current_proxy_id else {
+    let Some((current_proxy_id, current_image_proxy_id)) = current_proxy_ids else {
         return json_error(StatusCode::NOT_FOUND, "access key not found");
     };
 
     match conn.execute(
         "UPDATE access_keys
-         SET name = ?1, proxy_id = ?2, override_model = ?3, updated_at = strftime('%s', 'now')
-         WHERE id = ?4",
-        params![name, payload.proxy_id, override_model, id],
+         SET name = ?1, proxy_id = ?2, image_proxy_id = ?3, override_model = ?4, updated_at = strftime('%s', 'now')
+         WHERE id = ?5",
+        params![
+            name,
+            payload.proxy_id,
+            payload.image_proxy_id,
+            override_model,
+            id
+        ],
     ) {
         Ok(_) => {}
         Err(err) => {
@@ -3948,7 +4012,7 @@ async fn update_access_key(
         }
     }
 
-    if current_proxy_id != payload.proxy_id {
+    if current_proxy_id != payload.proxy_id || current_image_proxy_id != payload.image_proxy_id {
         clear_access_key_usage(&state, id).await;
     }
     if let Err(err) = reload_access_keys(&state).await {
@@ -4019,7 +4083,9 @@ async fn delete_pool(State(state): State<AppState>, Path(id): Path<i64>) -> Resp
     };
 
     let bound_access_key_ids = {
-        let mut stmt = match conn.prepare("SELECT id FROM access_keys WHERE proxy_id = ?1") {
+        let mut stmt = match conn
+            .prepare("SELECT id FROM access_keys WHERE proxy_id = ?1 OR image_proxy_id = ?1")
+        {
             Ok(stmt) => stmt,
             Err(err) => {
                 return json_error(
@@ -4051,6 +4117,18 @@ async fn delete_pool(State(state): State<AppState>, Path(id): Path<i64>) -> Resp
         }
         ids
     };
+
+    if let Err(err) = conn.execute(
+        "UPDATE access_keys
+         SET image_proxy_id = NULL, updated_at = strftime('%s', 'now')
+         WHERE image_proxy_id = ?1 AND proxy_id != ?1",
+        params![id],
+    ) {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to clear image proxy bindings: {err}"),
+        );
+    }
 
     if let Err(err) = conn.execute("DELETE FROM pools WHERE id = ?1", params![id]) {
         return json_error(
@@ -4849,9 +4927,18 @@ fn parse_bearer_auth(headers: &HeaderMap) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn access_key_proxy_id(access_key: &AccessKeyConfig, is_image_request: bool) -> i64 {
+    if is_image_request {
+        access_key.image_proxy_id.unwrap_or(access_key.proxy_id)
+    } else {
+        access_key.proxy_id
+    }
+}
+
 async fn proxy_for_access_key(
     state: &AppState,
     headers: &HeaderMap,
+    is_image_request: bool,
 ) -> Result<(PoolConfig, AccessKeyConfig), Response<Body>> {
     let Some(access_key_value) = parse_bearer_auth(headers) else {
         return Err(json_error(
@@ -4871,15 +4958,17 @@ async fn proxy_for_access_key(
 
     let pool = {
         let pools = state.pools.read().await;
-        pools
-            .iter()
-            .find(|pool| pool.id == access_key.proxy_id)
-            .cloned()
+        let proxy_id = access_key_proxy_id(&access_key, is_image_request);
+        pools.iter().find(|pool| pool.id == proxy_id).cloned()
     }
     .ok_or_else(|| {
         json_error(
             StatusCode::SERVICE_UNAVAILABLE,
-            "Bound proxy not found for this access key",
+            if is_image_request {
+                "Bound image proxy not found for this access key"
+            } else {
+                "Bound proxy not found for this access key"
+            },
         )
     })?;
 
@@ -4909,17 +4998,17 @@ fn build_override_models_response(model: &str) -> Response<Body> {
 async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<Body> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let (pool, access_key) = match proxy_for_access_key(&state, req.headers()).await {
-        Ok(result) => result,
-        Err(response) => return response,
-    };
+    let is_image_request = method == Method::POST && path == IMAGES_GENERATIONS_PATH;
+    let (pool, access_key) =
+        match proxy_for_access_key(&state, req.headers(), is_image_request).await {
+            Ok(result) => result,
+            Err(response) => return response,
+        };
     let inbound_endpoint = if method == Method::POST {
         OpenAiEndpoint::from_path(&path)
     } else {
         None
     };
-    let is_image_request = method == Method::POST && path == IMAGES_GENERATIONS_PATH;
-
     let query = req.uri().query().map(ToOwned::to_owned);
     let (parts, body) = req.into_parts();
     let buffered_body = match to_bytes(body, MAX_REQUEST_BODY_BYTES).await {
@@ -5462,6 +5551,33 @@ mod tests {
     }
 
     #[test]
+    fn drops_billing_summary_sse_event_but_keeps_chat_events() {
+        let mut completed_sent = false;
+        let context = BridgeContext::default();
+        let billing_event = "data: {\"object\":\"billing.summary\",\"billing\":{}}";
+        assert_eq!(
+            transform_sse_event(
+                billing_event,
+                ConversionMode::Direct,
+                &context,
+                &mut completed_sent,
+            ),
+            None
+        );
+
+        let chat_event = "data: {\"object\":\"chat.completion.chunk\",\"choices\":[]}";
+        assert_eq!(
+            transform_sse_event(
+                chat_event,
+                ConversionMode::Direct,
+                &context,
+                &mut completed_sent,
+            ),
+            Some(format!("{chat_event}\n\n"))
+        );
+    }
+
+    #[test]
     fn converts_chat_request_to_responses_request() {
         let body = br#"{
             "model":"gpt-test",
@@ -5877,6 +5993,91 @@ mod tests {
         let _ = fs::remove_file(path);
     }
 
+    #[tokio::test]
+    async fn image_generation_uses_access_key_image_proxy() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (request_tx, mut request_rx) = tokio::sync::mpsc::unbounded_channel();
+        let upstream = Router::new().route(
+            IMAGES_GENERATIONS_PATH,
+            post(move |headers: HeaderMap| {
+                let request_tx = request_tx.clone();
+                async move {
+                    let authorization = headers
+                        .get(header::AUTHORIZATION)
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    request_tx.send(authorization).unwrap();
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "application/json")],
+                        r#"{"created":0,"data":[]}"#,
+                    )
+                }
+            }),
+        );
+        let upstream_task = tokio::spawn(async move {
+            axum::serve(listener, upstream).await.unwrap();
+        });
+
+        let path = temp_db_path("image-access-key-proxy");
+        init_database(&path).unwrap();
+        let access_key = "me-1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd";
+        {
+            let conn = open_db(&path).unwrap();
+            conn.execute(
+                "INSERT INTO pools (name, note, is_active, created_at, updated_at)
+                 VALUES ('聊天代理', '', 1, strftime('%s', 'now'), strftime('%s', 'now'))",
+                [],
+            )
+            .unwrap();
+            let chat_pool_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO pools (name, note, is_active, created_at, updated_at)
+                 VALUES ('生图代理', '', 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                [],
+            )
+            .unwrap();
+            let image_pool_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO pool_base_urls (pool_id, name, base_url, protocol_mode, sort_order, created_at, updated_at)
+                 VALUES (?1, '生图供应商', ?2, 'both', 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![image_pool_id, format!("http://{address}")],
+            )
+            .unwrap();
+            let supplier_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO pool_image_keys (base_url_id, api_key, sort_order, manually_disabled, created_at, updated_at)
+                 VALUES (?1, 'sk-image-bound', 0, 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![supplier_id],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO access_keys (name, access_key, proxy_id, image_proxy_id, created_at, updated_at)
+                 VALUES ('客户端 A', ?1, ?2, ?3, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![access_key, chat_pool_id, image_pool_id],
+            )
+            .unwrap();
+        }
+
+        let state = test_app_state(&path);
+        let request = Request::builder()
+            .method(Method::POST)
+            .uri(IMAGES_GENERATIONS_PATH)
+            .header(header::AUTHORIZATION, format!("Bearer {access_key}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"model":"gpt-image-1","prompt":"a cat"}"#))
+            .unwrap();
+        let response = proxy_openai(State(state), request).await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(request_rx.recv().await.unwrap(), "Bearer sk-image-bound");
+
+        upstream_task.abort();
+        let _ = fs::remove_file(path);
+    }
+
     #[test]
     fn generated_access_key_uses_me_prefix() {
         let access_key = generate_access_key_value();
@@ -5892,6 +6093,7 @@ mod tests {
             access_key: "me-1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcd"
                 .to_string(),
             proxy_id: 1,
+            image_proxy_id: None,
             override_model: model.to_string(),
             created_at: 0,
             updated_at: 0,
@@ -6010,6 +6212,7 @@ mod tests {
             Json(AccessKeyPayload {
                 name: "客户端 A".to_string(),
                 proxy_id: pool_id,
+                image_proxy_id: None,
                 override_model: "gpt-5.4".to_string(),
             }),
         )
@@ -6031,6 +6234,7 @@ mod tests {
             Json(AccessKeyPayload {
                 name: "客户端 B".to_string(),
                 proxy_id: pool_id,
+                image_proxy_id: None,
                 override_model: "gpt-5.5".to_string(),
             }),
         )
@@ -6275,6 +6479,55 @@ mod tests {
         let key = &proxies.proxies[0].suppliers[0].keys[0];
         assert_eq!(key.test_model.as_deref(), Some("gpt-4.1-mini"));
         assert_eq!(key.test_protocol, Some(TestProtocol::Chat));
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn deleting_image_only_proxy_clears_access_key_image_binding() {
+        let path = temp_db_path("delete-image-proxy-binding");
+        init_database(&path).unwrap();
+
+        let (chat_pool_id, image_pool_id, access_key_id) = {
+            let conn = open_db(&path).unwrap();
+            conn.execute(
+                "INSERT INTO pools (name, note, is_active, created_at, updated_at)
+                 VALUES ('聊天代理', '', 1, strftime('%s', 'now'), strftime('%s', 'now'))",
+                [],
+            )
+            .unwrap();
+            let chat_pool_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO pools (name, note, is_active, created_at, updated_at)
+                 VALUES ('生图代理', '', 0, strftime('%s', 'now'), strftime('%s', 'now'))",
+                [],
+            )
+            .unwrap();
+            let image_pool_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO access_keys (name, access_key, proxy_id, image_proxy_id, created_at, updated_at)
+                 VALUES ('客户端 A', 'me-delete-image-proxy', ?1, ?2, strftime('%s', 'now'), strftime('%s', 'now'))",
+                params![chat_pool_id, image_pool_id],
+            )
+            .unwrap();
+            (chat_pool_id, image_pool_id, conn.last_insert_rowid())
+        };
+
+        let state = test_app_state(&path);
+        let response = delete_pool(State(state.clone()), Path(image_pool_id)).await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let image_proxy_id: Option<i64> = open_db(&path)
+            .unwrap()
+            .query_row(
+                "SELECT image_proxy_id FROM access_keys WHERE id = ?1",
+                params![access_key_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(image_proxy_id, None);
+        assert_eq!(state.access_keys.read().await[0].proxy_id, chat_pool_id);
+        assert_eq!(state.access_keys.read().await[0].image_proxy_id, None);
 
         let _ = fs::remove_file(path);
     }
