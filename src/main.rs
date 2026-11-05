@@ -32,6 +32,8 @@ const CHAT_PATH: &str = "/v1/chat/completions";
 const RESPONSES_PATH: &str = "/v1/responses";
 const MODELS_PATH: &str = "/v1/models";
 const IMAGES_GENERATIONS_PATH: &str = "/v1/images/generations";
+const IMAGES_EDITS_PATH: &str = "/v1/images/edits";
+const IMAGES_VARIATIONS_PATH: &str = "/v1/images/variations";
 const TEMP_BAN_FAILS: u32 = 3;
 const TEMP_BAN_MINUTES: i64 = 5;
 const DAILY_BAN_FAILS: u32 = 5;
@@ -4935,6 +4937,14 @@ fn access_key_proxy_id(access_key: &AccessKeyConfig, is_image_request: bool) -> 
     }
 }
 
+fn is_image_endpoint(method: &Method, path: &str) -> bool {
+    method == Method::POST
+        && matches!(
+            path,
+            IMAGES_GENERATIONS_PATH | IMAGES_EDITS_PATH | IMAGES_VARIATIONS_PATH
+        )
+}
+
 async fn proxy_for_access_key(
     state: &AppState,
     headers: &HeaderMap,
@@ -4998,7 +5008,7 @@ fn build_override_models_response(model: &str) -> Response<Body> {
 async fn proxy_openai(State(state): State<AppState>, req: Request) -> Response<Body> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
-    let is_image_request = method == Method::POST && path == IMAGES_GENERATIONS_PATH;
+    let is_image_request = is_image_endpoint(&method, &path);
     let (pool, access_key) =
         match proxy_for_access_key(&state, req.headers(), is_image_request).await {
             Ok(result) => result,
